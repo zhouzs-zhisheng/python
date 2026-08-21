@@ -1538,7 +1538,7 @@ def save_final_result(solvent_root, state, measurement):
         "check_status": "pending",
         "check_round": 0,
         "fine_density": float(measurement["density"]),
-        "fine_directory": str(Path(measurement["directory"]).resolve()),
+        "fine_directory": str(snapshot_dir),
         "check_tolerance": state.get("check_tolerance", CHECK_TOLERANCE),
         "check_max_retries": state.get("check_max_retries", CHECK_MAX_RETRIES),
         "check_extra_ns": state.get("check_extra_ns", CHECK_EXTRA_NS),
@@ -1555,8 +1555,10 @@ def save_final_result(solvent_root, state, measurement):
     state["status"] = "converged"
     state["current_trial_dir"] = measurement["directory"]
     # 同步 state 中的 fine_density / fine_directory / check_status
+    # fine_directory 指向 fine/ 快照目录（续算在此进行），
+    # 不是原始 trial 目录（measurement["directory"]）。
     state["fine_density"] = float(measurement["density"])
-    state["fine_directory"] = str(Path(measurement["directory"]).resolve())
+    state["fine_directory"] = str(snapshot_dir)
     state["check_status"] = "pending"
     state["check_round"] = 0
     state["check_measurements"] = []
@@ -1971,6 +1973,8 @@ def run_post_convergence_check(
 
     # 兼容旧 state（改造前已收敛的体系）：fine_density / fine_directory 缺失。
     # 优先从 final_density_result.json 回填，其次从 measurements 最后一条回填。
+    # fine_directory 必须指向 <solvent_root>/fine/ 快照目录（续算在此进行），
+    # 不是原始 trial 目录。
     if state.get("fine_density") is None or state.get("fine_directory") is None:
         backfilled = False
 
@@ -1993,13 +1997,15 @@ def run_post_convergence_check(
                     except (TypeError, ValueError):
                         pass
 
+            # fine_directory 优先用 snapshot_directory（指向 fine/ 快照），
+            # 而不是 directory（指向原始 trial 目录）。
             if state.get("fine_directory") is None:
-                d = result.get("directory")
+                d = result.get("snapshot_directory")
                 if d:
                     state["fine_directory"] = str(d)
                     backfilled = True
 
-        # 2. 从 measurements 最后一条回填
+        # 2. 从 measurements 最后一条回填 fine_density
         if state.get("fine_density") is None and state.get("measurements"):
             last = state["measurements"][-1]
             rho = last.get("density")
@@ -2010,18 +2016,18 @@ def run_post_convergence_check(
                 except (TypeError, ValueError):
                     pass
 
-        if state.get("fine_directory") is None and state.get("measurements"):
-            last = state["measurements"][-1]
-            d = last.get("directory")
-            if d:
-                state["fine_directory"] = str(d)
+        # 3. fine_directory 兜底：从 solvent_root 拼 <solvent_root>/fine/
+        if state.get("fine_directory") is None:
+            candidate = Path(solvent_root) / FINE_SNAPSHOT_DIR
+            if candidate.is_dir():
+                state["fine_directory"] = str(candidate.resolve())
                 backfilled = True
 
         if backfilled:
             save_state(solvent_root, state)
             print(
                 "\n[backfill] 检测到旧 state 缺 fine_density/fine_directory，"
-                "已从 final_density_result.json 或 measurements 回填："
+                "已从 final_density_result.json 或 solvent_root/fine/ 回填："
             )
             print(f"  fine_density    = {state.get('fine_density')}")
             print(f"  fine_directory  = {state.get('fine_directory')}")
