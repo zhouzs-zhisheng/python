@@ -1963,12 +1963,77 @@ def run_post_convergence_check(
         )
         return
 
-    if state.get("fine_density") is None:
-        fail("state.fine_density 缺失，无法进行 5ns check。")
+    # 兼容旧 state（改造前已收敛的体系）：fine_density / fine_directory 缺失。
+    # 优先从 final_density_result.json 回填，其次从 measurements 最后一条回填。
+    if state.get("fine_density") is None or state.get("fine_directory") is None:
+        backfilled = False
 
-    fine_dir = Path(state["fine_directory"])
-    if not fine_dir.is_dir():
-        fail(f"fine 收敛体系目录不存在：{fine_dir}")
+        # 1. 从 final_density_result.json 回填
+        result_path = Path(solvent_root) / FINAL_RESULT_JSON
+        if result_path.is_file():
+            try:
+                result = json.loads(
+                    result_path.read_text(encoding="utf-8")
+                )
+            except Exception:
+                result = {}
+
+            if state.get("fine_density") is None:
+                rho = result.get("density")
+                if rho is not None:
+                    try:
+                        state["fine_density"] = float(rho)
+                        backfilled = True
+                    except (TypeError, ValueError):
+                        pass
+
+            if state.get("fine_directory") is None:
+                d = result.get("directory")
+                if d:
+                    state["fine_directory"] = str(d)
+                    backfilled = True
+
+        # 2. 从 measurements 最后一条回填
+        if state.get("fine_density") is None and state.get("measurements"):
+            last = state["measurements"][-1]
+            rho = last.get("density")
+            if rho is not None:
+                try:
+                    state["fine_density"] = float(rho)
+                    backfilled = True
+                except (TypeError, ValueError):
+                    pass
+
+        if state.get("fine_directory") is None and state.get("measurements"):
+            last = state["measurements"][-1]
+            d = last.get("directory")
+            if d:
+                state["fine_directory"] = str(d)
+                backfilled = True
+
+        if backfilled:
+            save_state(solvent_root, state)
+            print(
+                "\n[backfill] 检测到旧 state 缺 fine_density/fine_directory，"
+                "已从 final_density_result.json 或 measurements 回填："
+            )
+            print(f"  fine_density    = {state.get('fine_density')}")
+            print(f"  fine_directory  = {state.get('fine_directory')}")
+
+    if state.get("fine_density") is None:
+        fail(
+            "state.fine_density 缺失，且无法从 final_density_result.json "
+            "或 measurements 回填。请检查 "
+            f"{Path(solvent_root) / FINAL_RESULT_JSON} 与 "
+            f"{Path(solvent_root) / STATE_JSON}。"
+        )
+
+    fine_dir = Path(state["fine_directory"]) if state.get("fine_directory") else None
+    if fine_dir is None or not fine_dir.is_dir():
+        fail(
+            f"fine 收敛体系目录不存在或未指定：{fine_dir}\n"
+            "请检查 final_density_result.json 中的 directory 字段。"
+        )
 
     # 原始 NVT 总时长（ps），作为第 1 轮 check 的 -b 起算时间
     t0 = original_nvt_end_ps(nvt_mdp)
