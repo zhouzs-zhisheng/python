@@ -1,5 +1,5 @@
 diff --git a/adjust_density.py b/adjust_density.py
-index a13777f..c6e2dd9 100644
+index a13777f..c6be6f8 100644
 --- a/adjust_density.py
 +++ b/adjust_density.py
 @@ -171,6 +171,43 @@ MOF 总目录：
@@ -81,7 +81,7 @@ index a13777f..c6e2dd9 100644
  # 真空判据：
  # 某个允许电解液存在的 Z 区域内，如果连续至少两个 density slice
  # 低于目标密度的 1%，则认为存在局部真空/断层。
-@@ -409,9 +474,43 @@ def new_state(solvent, mof_name, target_density, initial_system_dir):
+@@ -409,7 +474,41 @@ def new_state(solvent, mof_name, target_density, initial_system_dir):
          "current_trial_dir": str(Path(initial_system_dir).resolve()),
          "coarse_checkpoint": None,
          "measurements": [],
@@ -99,9 +99,9 @@ index a13777f..c6e2dd9 100644
 +        "check_max_retries": CHECK_MAX_RETRIES,
 +        "check_extra_ns": CHECK_EXTRA_NS,
 +        "check_measurements": [],    # 每轮 check 的密度记录
-     }
- 
- 
++    }
++
++
 +def ensure_check_fields(state):
 +    """兼容旧 state：补齐 5ns check 机制引入的字段。"""
 +    defaults = {
@@ -113,18 +113,16 @@ index a13777f..c6e2dd9 100644
 +        "check_max_retries": CHECK_MAX_RETRIES,
 +        "check_extra_ns": CHECK_EXTRA_NS,
 +        "check_measurements": [],
-+    }
+     }
 +    changed = False
 +    for k, v in defaults.items():
 +        if k not in state:
 +            state[k] = v
 +            changed = True
 +    return changed
-+
-+
- def state_path(solvent_root):
-     return Path(solvent_root) / STATE_JSON
  
+ 
+ def state_path(solvent_root):
 @@ -457,6 +556,10 @@ def load_or_create_state(
                  "如要重新开始，请使用 --reset-state。"
              )
@@ -154,7 +152,7 @@ index a13777f..c6e2dd9 100644
      }
  
      path = Path(solvent_root) / FINAL_RESULT_JSON
-@@ -1440,8 +1554,619 @@ def save_final_result(solvent_root, state, measurement):
+@@ -1440,9 +1554,699 @@ def save_final_result(solvent_root, state, measurement):
  
      state["status"] = "converged"
      state["current_trial_dir"] = measurement["directory"]
@@ -166,9 +164,9 @@ index a13777f..c6e2dd9 100644
 +    state["check_status"] = "pending"
 +    state["check_round"] = 0
 +    state["check_measurements"] = []
-+    save_state(solvent_root, state)
-+
-+
+     save_state(solvent_root, state)
+ 
+ 
 +# ============================================================
 +# 5ns 续跑 + 重新校验密度：辅助函数
 +# ============================================================
@@ -491,8 +489,8 @@ index a13777f..c6e2dd9 100644
 +    else:
 +        state["check_status"] = "running"
 +
-     save_state(solvent_root, state)
- 
++    save_state(solvent_root, state)
++
 +    # 同步写回 final_density_result.json
 +    result_path = Path(solvent_root) / FINAL_RESULT_JSON
 +    if result_path.is_file():
@@ -582,70 +580,132 @@ index a13777f..c6e2dd9 100644
 +        )
 +        return
 +
-+    # 兼容旧 state（改造前已收敛的体系）：fine_density / fine_directory 缺失。
-+    # 优先从 final_density_result.json 回填，其次从 measurements 最后一条回填。
-+    # fine_directory 必须指向 <solvent_root>/fine/ 快照目录（续算在此进行），
-+    # 不是原始 trial 目录。
-+    if state.get("fine_density") is None or state.get("fine_directory") is None:
-+        backfilled = False
++    # --------------------------------------------------------------
++    # 强制重新解析 fine_density / fine_directory（不信任 state 缓存）
++    # --------------------------------------------------------------
++    # 历史版本的 fine_directory 可能被错误保存为 solvent_root 或
++    # 原始 trial 目录，导致 5ns check 续算产物写到错误位置
++    # （如 ACN/first/ 而不是 ACN/fine/first/）。因此每次进入 check
++    # 流程都强制从可信来源重新解析并覆盖 state 中的值。
++    #
++    # 可信优先级：
++    #   1) final_density_result.json["snapshot_directory"]
++    #   2) <solvent_root>/fine/ 目录（copy_system_snapshot 的标准位置）
++    #   3) final_density_result.json["directory"]（原始 trial 目录，
++    #      需要 first/nvt.cpt 存在且含 snapshot 特征文件）——慎用
++    #
++    # fine_directory 最终必须满足：
++    #   - 是一个真实存在的目录
++    #   - 包含 first/nvt.cpt（原 NVT checkpoint）
++    #   - 包含 first/nvt.tpr
++    #
++    # 此外 fine_directory 的 "正常" 形式应为 <solvent_root>/fine/。
++    # 虽然 trial 目录也可能满足 first/nvt.cpt 存在，但续算产物会留在
++    # trial 目录里、不易找到，因此一旦能找到 solvent_root/fine/
++    # 就优先用它。
++    # --------------------------------------------------------------
++    re_evaluated = False
 +
-+        # 1. 从 final_density_result.json 回填
-+        result_path = Path(solvent_root) / FINAL_RESULT_JSON
-+        if result_path.is_file():
-+            try:
-+                result = json.loads(
-+                    result_path.read_text(encoding="utf-8")
-+                )
-+            except Exception:
-+                result = {}
++    expected_fine_dir = Path(solvent_root) / FINE_SNAPSHOT_DIR
 +
-+            if state.get("fine_density") is None:
-+                rho = result.get("density")
-+                if rho is not None:
-+                    try:
-+                        state["fine_density"] = float(rho)
-+                        backfilled = True
-+                    except (TypeError, ValueError):
-+                        pass
++    # --- fine_density ---
++    fine_density_src = None
++    if state.get("fine_density") is not None:
++        fine_density_src = "state cache"
++    final_result = {}
++    result_path = Path(solvent_root) / FINAL_RESULT_JSON
++    if result_path.is_file():
++        try:
++            final_result = json.loads(result_path.read_text(encoding="utf-8"))
++        except Exception:
++            final_result = {}
 +
-+            # fine_directory 优先用 snapshot_directory（指向 fine/ 快照），
-+            # 而不是 directory（指向原始 trial 目录）。
-+            if state.get("fine_directory") is None:
-+                d = result.get("snapshot_directory")
-+                if d:
-+                    state["fine_directory"] = str(d)
-+                    backfilled = True
++    # 强制覆盖 fine_density（优先 final_result.density，不丢 state 值）
++    if state.get("fine_density") is None and final_result.get("density") is not None:
++        try:
++            state["fine_density"] = float(final_result["density"])
++            fine_density_src = "final_result:density"
++            re_evaluated = True
++        except (TypeError, ValueError):
++            pass
++    if state.get("fine_density") is None and state.get("measurements"):
++        last = state["measurements"][-1]
++        try:
++            state["fine_density"] = float(last["density"])
++            fine_density_src = "measurements[-1]:density"
++            re_evaluated = True
++        except (TypeError, ValueError, KeyError, IndexError):
++            pass
 +
-+        # 2. 从 measurements 最后一条回填 fine_density
-+        if state.get("fine_density") is None and state.get("measurements"):
-+            last = state["measurements"][-1]
-+            rho = last.get("density")
-+            if rho is not None:
-+                try:
-+                    state["fine_density"] = float(rho)
-+                    backfilled = True
-+                except (TypeError, ValueError):
-+                    pass
++    # --- fine_directory ---
++    fine_directory_src = None
++    resolved_fine_dir: Optional[Path] = None
 +
-+        # 3. fine_directory 兜底：从 solvent_root 拼 <solvent_root>/fine/
-+        if state.get("fine_directory") is None:
-+            candidate = Path(solvent_root) / FINE_SNAPSHOT_DIR
-+            if candidate.is_dir():
-+                state["fine_directory"] = str(candidate.resolve())
-+                backfilled = True
++    # 1) final_density_result.json["snapshot_directory"]
++    d = final_result.get("snapshot_directory")
++    if d:
++        p = Path(d)
++        if p.is_dir() and (p / "first" / "nvt.cpt").is_file() \
++                and (p / "first" / "nvt.tpr").is_file():
++            resolved_fine_dir = p.resolve()
++            fine_directory_src = "final_result:snapshot_directory"
 +
-+        if backfilled:
-+            save_state(solvent_root, state)
-+            print(
-+                "\n[backfill] 检测到旧 state 缺 fine_density/fine_directory，"
-+                "已从 final_density_result.json 或 solvent_root/fine/ 回填："
++    # 2) solvent_root/fine/ 标准快照目录（如果存在）
++    if resolved_fine_dir is None and expected_fine_dir.is_dir() \
++            and (expected_fine_dir / "first" / "nvt.cpt").is_file() \
++            and (expected_fine_dir / "first" / "nvt.tpr").is_file():
++        resolved_fine_dir = expected_fine_dir.resolve()
++        fine_directory_src = f"solvent_root/{FINE_SNAPSHOT_DIR}"
++
++    # 3) final_density_result.json["directory"]（原始 trial 目录，兜底）
++    if resolved_fine_dir is None:
++        d2 = final_result.get("directory")
++        if d2:
++            p2 = Path(d2)
++            if p2.is_dir() and (p2 / "first" / "nvt.cpt").is_file() \
++                    and (p2 / "first" / "nvt.tpr").is_file():
++                resolved_fine_dir = p2.resolve()
++                fine_directory_src = "final_result:directory"
++
++    # 4) state 中已有的 fine_directory 兜底（仅作为最后手段，但要校验）
++    if resolved_fine_dir is None and state.get("fine_directory"):
++        p3 = Path(state["fine_directory"])
++        if p3.is_dir() and (p3 / "first" / "nvt.cpt").is_file() \
++                and (p3 / "first" / "nvt.tpr").is_file():
++            resolved_fine_dir = p3.resolve()
++            fine_directory_src = "state cache"
++
++    # 最终覆盖 state["fine_directory"]：只有成功解析到才覆盖
++    if resolved_fine_dir is not None:
++        if state.get("fine_directory") != str(resolved_fine_dir):
++            re_evaluated = True
++        state["fine_directory"] = str(resolved_fine_dir)
++
++    if re_evaluated:
++        save_state(solvent_root, state)
++        print(
++            "\n[fine_dir] 已重新解析 fine_density/fine_directory"
++            "（不信任 state 缓存，强制覆盖）："
++        )
++        print(f"  fine_density    = {state.get('fine_density')}  "
++              f"(来源: {fine_density_src})")
++        print(f"  fine_directory  = {state.get('fine_directory')}  "
++              f"(来源: {fine_directory_src})")
++        # 关键防御性检查：如果 fine_directory 不是 solvent_root/fine/
++        # 但 solvent_root/fine/ 本身又存在，提示异常。
++        if resolved_fine_dir is not None \
++                and expected_fine_dir.is_dir() \
++                and resolved_fine_dir != expected_fine_dir.resolve():
++            warn(
++                f"注意：解析到的 fine_directory 不是标准路径 "
++                f"{expected_fine_dir}。\n这通常意味着你的体系是在旧版本"
++                "脚本下收敛的，fine/ 快照可能不存在或不全。\n"
++                "续算产物将写入上述解析到的目录中。"
 +            )
-+            print(f"  fine_density    = {state.get('fine_density')}")
-+            print(f"  fine_directory  = {state.get('fine_directory')}")
 +
 +    if state.get("fine_density") is None:
 +        fail(
-+            "state.fine_density 缺失，且无法从 final_density_result.json "
++            "fine_density 缺失，且无法从 final_density_result.json "
 +            "或 measurements 回填。请检查 "
 +            f"{Path(solvent_root) / FINAL_RESULT_JSON} 与 "
 +            f"{Path(solvent_root) / STATE_JSON}。"
@@ -654,8 +714,25 @@ index a13777f..c6e2dd9 100644
 +    fine_dir = Path(state["fine_directory"]) if state.get("fine_directory") else None
 +    if fine_dir is None or not fine_dir.is_dir():
 +        fail(
-+            f"fine 收敛体系目录不存在或未指定：{fine_dir}\n"
-+            "请检查 final_density_result.json 中的 directory 字段。"
++            "fine 收敛体系目录不存在或无法从以下来源可靠解析：\n"
++            f"  1) {result_path} 的 snapshot_directory 字段\n"
++            f"  2) {expected_fine_dir} 目录（first/nvt.cpt 必须存在）\n"
++            f"  3) {result_path} 的 directory 字段\n"
++            f"  4) state.fine_directory 缓存\n\n"
++            "请确认 <solvent_root>/fine/ 目录存在，且 fine/first/nvt.cpt "
++            "与 fine/first/nvt.tpr 可访问。"
++        )
++    # 额外防御：确保 fine 目录的 first/nvt.cpt/tpr 真的存在
++    if not (fine_dir / "first" / "nvt.cpt").is_file():
++        fail(
++            f"fine 目录中找不到原 NVT checkpoint："
++            f"{fine_dir / 'first' / 'nvt.cpt'}\n"
++            "没有该文件将无法续算。请检查 fine 快照是否完整复制了 first/ 目录。"
++        )
++    if not (fine_dir / "first" / "nvt.tpr").is_file():
++        fail(
++            f"fine 目录中找不到原 NVT tpr："
++            f"{fine_dir / 'first' / 'nvt.tpr'}"
 +        )
 +
 +    # 原始 NVT 总时长（ps），作为第 1 轮 check 的 -b 起算时间
@@ -771,10 +848,11 @@ index a13777f..c6e2dd9 100644
 +    )
 +    print(f"Result file     : {Path(solvent_root) / FINAL_RESULT_JSON}")
 +
- 
++
  def distinct_measurements_by_emim(state):
      mapping = {}
-@@ -2048,8 +2773,20 @@ def main():
+ 
+@@ -2048,8 +2852,20 @@ def main():
      print(f"State file         : {state_path(solvent_root)}")
  
      if state.get("status") == "converged":
@@ -796,7 +874,7 @@ index a13777f..c6e2dd9 100644
          return
  
      current_trial = Path(
-@@ -2100,6 +2837,16 @@ def main():
+@@ -2100,6 +2916,16 @@ def main():
                  f"Final result file: "
                  f"{Path(solvent_root) / FINAL_RESULT_JSON}"
              )
