@@ -1741,12 +1741,18 @@ def extend_nvt_for_check(
 
     # gmx mdrun -s first/nvt_check_rN.tpr -cpi <base_cpt>
     #            -deffnm first/nvt_check_rN
-    # 用相对路径更稳妥（避免 cwd 与绝对路径混用）
+    # -cpi 必须用相对于 cwd(system_dir) 的路径，否则会找不到 checkpoint
+    # 而从 tpr 起始 step 重新开始模拟（即从头跑完整时长，而非续算）。
+    try:
+        cpt_arg = str(base_cpt.relative_to(system_dir))
+    except ValueError:
+        # base_cpt 不在 system_dir 下，用绝对路径
+        cpt_arg = str(base_cpt)
+
     cmd = [
         "gmx", "mdrun",
         "-s", f"first/{CHECK_TPR_PREFIX}r{round_idx}.tpr",
-        "-cpi", str(base_cpt.name) if base_cpt.parent.resolve() == first.resolve()
-        else str(base_cpt),
+        "-cpi", cpt_arg,
         "-deffnm", f"first/{CHECK_TPR_PREFIX}r{round_idx}",
         "-v",
         "-ntomp", str(NTOMP),
