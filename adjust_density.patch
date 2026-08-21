@@ -1,0 +1,815 @@
+diff --git a/adjust_density.py b/adjust_density.py
+index a13777f..c6e2dd9 100644
+--- a/adjust_density.py
++++ b/adjust_density.py
+@@ -171,6 +171,43 @@ MOF 总目录：
+     - 若 NVT 已有 nvt.gro，则视为完成；
+     - 若只有 nvt.cpt，可从 checkpoint 继续 NVT；
+     - 已记录过的 density 不重复计算。
++
++fine 收敛后的 5ns 续跑校验（POST-CONVERGENCE 5NS CHECK）
++-----------------------------------------------------
++fine 阶段达到容差后，并不立即结束，而是继续对最终收敛体系做稳定性校验：
++
++    1. 用 gmx convert-tpr -extend 5000 + mdrun -cpi 从 first/nvt.cpt 续算 5ns，
++       生成 first/nvt_check_r{N}.tpr / .xtc / .gro / .cpt。
++    2. 只对“新增的 5ns 段”跑 gmx density（-b 跳过原 NVT 段），
++       生成 first/density_check_r{N}.xvg，取 Z=18~22 nm 平均密度 ρ_check。
++    3. 判据：
++           |ρ_check - ρ_fine| / ρ_fine > 1%   -> 重跑（再续 5ns）
++           否则                              -> check_passed，记录
++       其中 ρ_fine 是 fine 收敛时记录的密度。
++    4. 最多重跑 CHECK_MAX_RETRIES（默认 3）轮，仍未稳定则告警退出。
++    5. 第 N+1 轮基于第 N 轮的 nvt_check_rN.cpt 续算，
++       即累计延伸 (N+1)*5ns，每轮独立统计该轮新增 5ns 段的密度。
++
++可重复性（重要）
++----------------
++重新运行本脚本时，对已经 fine 收敛的体系不会重复调密度、不会重写
++final_density_result.json，而是按 state["check_status"] 处理：
++
++    - check_status == "passed"              直接报告完成
++    - check_status == "max_retries_exceeded" 告警退出（提示人工检查）
++    - check_status in (pending, running)    从 state["check_round"]+1 继续
++
++每轮续算/密度统计的中间文件按 round 索引独立命名
++（nvt_check_r1.xtc / density_check_r1.xvg ...），已存在的文件直接复用，
++不会因任务中断而需要从头重跑整个 5ns check 流程。
++
++调度器无关性
++------------
++本脚本本身只依赖 gmx / packmol / itptools 在 PATH 中可执行，与具体
++批处理调度器（PBS / Slurm / LSF / 本地）无关。PBS 字样仅出现在示例
++文档中，可替换为对应的 sbatch / bsub / 直接 python 运行。
++唯一约束：调密度主循环需要在单个长任务内连续运行，依赖
++density_adjustment.json 维护迭代状态。
+ """
+ 
+ import argparse
+@@ -198,6 +235,34 @@ DENSITY_Z_MAX_NM = 22.0
+ DENSITY_SLICES = 1000
+ DENSITY_GROUP = 6
+ 
++# ============================================================
++# 达到 fine 收敛后的“5ns 续跑 + 重新校验密度”机制
++#
++# 流程：
++#   1. 在 fine 收敛体系上，用 gmx convert-tpr -extend + mdrun -cpi
++#      从 first/nvt.cpt 续算 5ns，生成 first/nvt_check_rN.{tpr,xtc,gro,cpt}。
++#   2. 只对“新增的 5ns 段”跑 gmx density（-b 跳过原 NVT 段）。
++#   3. 比较 ρ_check 与 ρ_fine：
++#        |ρ_check - ρ_fine| / ρ_fine > CHECK_TOLERANCE  -> 重跑（再续 5ns）
++#        否则记录为 check_passed。
++#   4. 最多重跑 CHECK_MAX_RETRIES 次；仍未稳定则告警退出。
++#
++# 中断恢复：
++#   - 每轮独立的 nvt_check_rN.* 与 density_check_rN.xvg 文件，
++#     重新运行脚本时已存在的文件不重跑。
++#   - state["check_status"] / state["check_round"] 持久化进度。
++# ============================================================
++CHECK_EXTRA_NS = 5.0          # 每轮续跑的额外模拟时长（ns）
++CHECK_TOLERANCE = 0.01        # |ρ_check - ρ_fine| / ρ_fine 阈值（1%）
++CHECK_MAX_RETRIES = 3         # 最多重跑次数
++
++# check 阶段产物命名前缀（按 round 索引，后缀由 check_round_files 拼接 r{N}）
++CHECK_TPR_PREFIX = "nvt_check_"
++CHECK_XTC_PREFIX = "nvt_check_"
++CHECK_GRO_PREFIX = "nvt_check_"
++CHECK_CPT_PREFIX = "nvt_check_"
++CHECK_XVG_PREFIX = "density_check_"
++
+ # 真空判据：
+ # 某个允许电解液存在的 Z 区域内，如果连续至少两个 density slice
+ # 低于目标密度的 1%，则认为存在局部真空/断层。
+@@ -409,9 +474,43 @@ def new_state(solvent, mof_name, target_density, initial_system_dir):
+         "current_trial_dir": str(Path(initial_system_dir).resolve()),
+         "coarse_checkpoint": None,
+         "measurements": [],
++        # === fine 收敛后的 5ns 续跑校验状态 ===
++        # check_status:
++        #   "pending"           已达 fine，尚未开始 5ns check
++        #   "running"           正在执行某一轮 5ns 续算/密度统计
++        #   "passed"            某轮 check 密度变化 <= 1%，已确认稳定
++        #   "max_retries_exceeded" 已达最大重跑次数仍未稳定
++        "check_status": "pending",
++        "check_round": 0,            # 已开始/已完成的 round 数
++        "fine_density": None,        # fine 收敛时记录的 ρ_fine
++        "fine_directory": None,      # fine 收敛体系目录
++        "check_tolerance": CHECK_TOLERANCE,
++        "check_max_retries": CHECK_MAX_RETRIES,
++        "check_extra_ns": CHECK_EXTRA_NS,
++        "check_measurements": [],    # 每轮 check 的密度记录
+     }
+ 
+ 
++def ensure_check_fields(state):
++    """兼容旧 state：补齐 5ns check 机制引入的字段。"""
++    defaults = {
++        "check_status": "pending",
++        "check_round": 0,
++        "fine_density": None,
++        "fine_directory": None,
++        "check_tolerance": CHECK_TOLERANCE,
++        "check_max_retries": CHECK_MAX_RETRIES,
++        "check_extra_ns": CHECK_EXTRA_NS,
++        "check_measurements": [],
++    }
++    changed = False
++    for k, v in defaults.items():
++        if k not in state:
++            state[k] = v
++            changed = True
++    return changed
++
++
+ def state_path(solvent_root):
+     return Path(solvent_root) / STATE_JSON
+ 
+@@ -457,6 +556,10 @@ def load_or_create_state(
+                 "如要重新开始，请使用 --reset-state。"
+             )
+ 
++        # 兼容旧 state：补齐 5ns check 机制引入的字段
++        if ensure_check_fields(state):
++            save_state(solvent_root, state)
++
+         return state
+ 
+     state = new_state(
+@@ -1429,6 +1532,17 @@ def save_final_result(solvent_root, state, measurement):
+         "vacuum_detected": measurement.get("vacuum_detected", False),
+         "vacuum_fraction": measurement.get("vacuum_fraction", 0.0),
+         "coarse_checkpoint": state.get("coarse_checkpoint"),
++        # === 5ns 续跑校验初始状态 ===
++        # fine 收敛刚达成时，check 阶段尚未开始，标记为 pending。
++        # 后续 run_post_convergence_check 会把这些字段逐步更新。
++        "check_status": "pending",
++        "check_round": 0,
++        "fine_density": float(measurement["density"]),
++        "fine_directory": str(snapshot_dir),
++        "check_tolerance": state.get("check_tolerance", CHECK_TOLERANCE),
++        "check_max_retries": state.get("check_max_retries", CHECK_MAX_RETRIES),
++        "check_extra_ns": state.get("check_extra_ns", CHECK_EXTRA_NS),
++        "check_measurements": [],
+     }
+ 
+     path = Path(solvent_root) / FINAL_RESULT_JSON
+@@ -1440,8 +1554,619 @@ def save_final_result(solvent_root, state, measurement):
+ 
+     state["status"] = "converged"
+     state["current_trial_dir"] = measurement["directory"]
++    # 同步 state 中的 fine_density / fine_directory / check_status
++    # fine_directory 指向 fine/ 快照目录（续算在此进行），
++    # 不是原始 trial 目录（measurement["directory"]）。
++    state["fine_density"] = float(measurement["density"])
++    state["fine_directory"] = str(snapshot_dir)
++    state["check_status"] = "pending"
++    state["check_round"] = 0
++    state["check_measurements"] = []
++    save_state(solvent_root, state)
++
++
++# ============================================================
++# 5ns 续跑 + 重新校验密度：辅助函数
++# ============================================================
++
++def parse_mdp_nsteps_dt(mdp_path):
++    """
++    从 GROMACS mdp 中读取 nsteps 与 dt，返回 (nsteps, dt_ps)。
++
++    用于推算原 NVT 的总时长 T0 = nsteps * dt（ps），
++    作为续算后只统计新增 5ns 段密度的 -b 起算时间。
++
++    mdp 中 nsteps 通常为整数；dt 可能是 0.001 / 0.002 / 0.005 等。
++    """
++    mdp_path = Path(mdp_path)
++    if not mdp_path.is_file():
++        fail(f"找不到 mdp 文件：{mdp_path}")
++
++    nsteps = None
++    dt = None
++
++    with open(mdp_path, "r", encoding="utf-8", errors="replace") as f:
++        for raw in f:
++            line = raw.split(";", 1)[0].strip()
++            if not line or "=" not in line:
++                continue
++            key, _, value = line.partition("=")
++            key = key.strip().lower()
++            value = value.strip()
++
++            if key == "nsteps":
++                try:
++                    nsteps = int(value)
++                except ValueError:
++                    fail(f"mdp 中 nsteps 非法：{value!r}")
++            elif key == "dt":
++                try:
++                    dt = float(value)
++                except ValueError:
++                    fail(f"mdp 中 dt 非法：{value!r}")
++
++            if nsteps is not None and dt is not None:
++                break
++
++    if nsteps is None:
++        fail(f"mdp 中未找到 nsteps：{mdp_path}")
++    if dt is None:
++        fail(f"mdp 中未找到 dt：{mdp_path}")
++    if nsteps <= 0:
++        fail(f"mdp 中 nsteps 必须为正：{nsteps}")
++    if dt <= 0:
++        fail(f"mdp 中 dt 必须为正：{dt}")
++
++    return nsteps, dt
++
++
++def original_nvt_end_ps(nvt_mdp):
++    """
++    计算原 NVT tpr 的总时长（ps）。
++
++    若 mdp 中 nsteps = -1（无限制），则取一个保守的默认值
++    DENSITY_BEGIN_PS（7000 ps）作为兜底，并打印警告。
++    """
++    nsteps, dt = parse_mdp_nsteps_dt(nvt_mdp)
++    if nsteps < 0:
++        warn(
++            f"nvt.mdp 中 nsteps={nsteps}（无限制），"
++            f"使用默认 {DENSITY_BEGIN_PS} ps 作为原 NVT 时长。"
++        )
++        return float(DENSITY_BEGIN_PS)
++    return nsteps * dt
++
++
++def check_round_files(system_dir, round_idx):
++    """
++    返回第 round_idx 轮 check 的所有产物路径。
++
++    每轮独立命名，便于中断后恢复：
++        first/nvt_check_r1.tpr / .xtc / .gro / .cpt
++        first/density_check_r1.xvg
++    """
++    first = Path(system_dir) / "first"
++    suffix = f"r{round_idx}"
++    return {
++        "tpr":  first / f"{CHECK_TPR_PREFIX}{suffix}.tpr",
++        "xtc":  first / f"{CHECK_XTC_PREFIX}{suffix}.xtc",
++        "gro":  first / f"{CHECK_GRO_PREFIX}{suffix}.gro",
++        "cpt":  first / f"{CHECK_CPT_PREFIX}{suffix}.cpt",
++        "xvg":  first / f"{CHECK_XVG_PREFIX}{suffix}.xvg",
++    }
++
++
++def extend_nvt_for_check(
++    system_dir,
++    nvt_mdp,
++    round_idx,
++    extra_ns,
++    base_cpt=None,
++):
++    """
++    在 fine 收敛体系的 NVT 基础上续算 extra_ns 纳秒。
++
++    使用 gmx convert-tpr -extend 把 tpr 的总步数延长 extra_ns/dt 步，
++    再用 mdrun -cpi 从上一轮的 cpt（或原 nvt.cpt）续算。
++
++    参数：
++        system_dir : fine 收敛体系目录
++        nvt_mdp    : 原 nvt.mdp（用于解析 dt）
++        round_idx  : 当前轮次（1 起）
++        extra_ns   : 本轮续算时长（ns）
++        base_cpt   : 续算起点的 cpt；None 时按 round_idx 自动选择
++                     round 1 -> first/nvt.cpt
++                     round N -> first/nvt_check_r(N-1).cpt
++
++    可重复性：
++        若本轮 tpr+xtc+gro+cpt 都已存在，直接跳过续算；
++        若只 tpr 缺失但其它都存在，视为异常，fail。
++    """
++    system_dir = Path(system_dir)
++    first = system_dir / "first"
++    first.mkdir(exist_ok=True)
++
++    paths = check_round_files(system_dir, round_idx)
++
++    # 已完整生成则跳过
++    if (
++        paths["tpr"].is_file()
++        and paths["xtc"].is_file()
++        and paths["gro"].is_file()
++        and paths["cpt"].is_file()
++    ):
++        print(
++            f"第 {round_idx} 轮 NVT 续算已完成，跳过："
++            f"{paths['xtc']}"
++        )
++        return paths
++
++    # 解析 dt
++    _, dt = parse_mdp_nsteps_dt(nvt_mdp)
++    extend_ps = float(extra_ns) * 1000.0
++    extend_steps = int(round(extend_ps / dt))
++
++    # 自动选择 base cpt
++    if base_cpt is None:
++        if round_idx == 1:
++            base_cpt = first / "nvt.cpt"
++        else:
++            prev = check_round_files(system_dir, round_idx - 1)
++            base_cpt = prev["cpt"]
++    else:
++        base_cpt = Path(base_cpt)
++
++    if not base_cpt.is_file():
++        fail(
++            f"找不到续算起点 cpt：{base_cpt}\n"
++            f"请确认原 NVT 已完成（first/nvt.cpt 存在）。"
++        )
++
++    # gmx convert-tpr -s first/nvt.tpr -extend <ps> -o first/nvt_check_rN.tpr
++    # 注意：convert-tpr 的 -extend 单位是 ps。
++    if not paths["tpr"].is_file():
++        print(
++            f"\n[convert-tpr] 续算 {extend_ps:.1f} ps "
++            f"({extra_ns:.1f} ns / dt={dt}) -> {paths['tpr']}"
++        )
++        run_command(
++            [
++                "gmx", "convert-tpr",
++                "-s", "first/nvt.tpr",
++                "-extend", f"{extend_ps:.1f}",
++                "-o", str(paths["tpr"].relative_to(system_dir)),
++            ],
++            cwd=system_dir,
++        )
++    else:
++        print(f"第 {round_idx} 轮 tpr 已存在，跳过 convert-tpr：{paths['tpr']}")
++
++    # gmx mdrun -s first/nvt_check_rN.tpr -cpi <base_cpt> -noappend
++    #            -deffnm first/nvt_check_rN
++    # 关键 GROMACS 续跑要求（参考 ensure_nvt 的 -append 机制）：
++    #   -cpi 默认走 append 模式，要求 -deffnm 与原模拟一致（first/nvt），
++    #       并追加到原 first/nvt.xtc 等输出文件；
++    #   - 但 check 每轮需要独立命名（first/nvt_check_rN.*），不污染原轨迹，
++    #     所以必须用 -noappend：从 checkpoint 的 step 续算，
++    #     但用 -deffnm 指定的新名字写新输出文件。
++    #   - -cpi 必须用相对于 cwd(system_dir) 的路径，否则会找不到 checkpoint
++    #     而从 tpr 起始 step 重新开始模拟（即从头跑完整时长，而非续算）。
++    try:
++        cpt_arg = str(base_cpt.relative_to(system_dir))
++    except ValueError:
++        # base_cpt 不在 system_dir 下，用绝对路径
++        cpt_arg = str(base_cpt)
++
++    cmd = [
++        "gmx", "mdrun",
++        "-s", f"first/{CHECK_TPR_PREFIX}r{round_idx}.tpr",
++        "-cpi", cpt_arg,
++        "-noappend",
++        "-deffnm", f"first/{CHECK_TPR_PREFIX}r{round_idx}",
++        "-v",
++        "-ntomp", str(NTOMP),
++        "-ntmpi", str(NTMPI),
++    ]
++
++    print(
++        f"[mdrun] 续算 {extend_ps:.1f} ps，"
++        f"基于 cpt {base_cpt} -> {paths['gro']}"
++    )
++    run_command(cmd, cwd=system_dir)
++
++    for key in ("gro", "xtc", "cpt"):
++        if not paths[key].is_file():
++            fail(
++                f"第 {round_idx} 轮 NVT 续算结束后未生成：{paths[key]}"
++            )
++
++    return paths
++
++
++def run_check_density(system_dir, round_idx, begin_ps):
++    """
++    对第 round_idx 轮续算得到的 nvt_check_rN.xtc 跑 gmx density，
++    只统计 t >= begin_ps 之后的密度。
++
++    自动选择 group 6（与原 measure_system 保持一致）。
++
++    可重复性：
++        若 density_check_rN.xvg 已存在，直接复用。
++    """
++    system_dir = Path(system_dir)
++    first = system_dir / "first"
++    paths = check_round_files(system_dir, round_idx)
++
++    xtc = paths["xtc"]
++    tpr = paths["tpr"]
++    xvg = paths["xvg"]
++    index = system_dir / "index.ndx"
++
++    if xvg.is_file():
++        print(f"第 {round_idx} 轮 check 密度已存在，复用：{xvg}")
++        return xvg
++
++    for p in (xtc, tpr, index):
++        if not p.is_file():
++            fail(f"check density 输入文件不存在：{p}")
++
++    run_command(
++        [
++            "gmx", "density",
++            "-f", f"first/{CHECK_XTC_PREFIX}r{round_idx}.xtc",
++            "-s", f"first/{CHECK_TPR_PREFIX}r{round_idx}.tpr",
++            "-n", "../index.ndx",
++            "-sl", str(DENSITY_SLICES),
++            "-o", f"first/{CHECK_XVG_PREFIX}r{round_idx}.xvg",
++            "-d", "Z",
++            "-b", f"{begin_ps:.1f}",
++        ],
++        cwd=first,
++        stdin_text=f"{DENSITY_GROUP}\n",
++    )
++
++    if not xvg.is_file():
++        fail(f"gmx density 后未生成：{xvg}")
++
++    return xvg
++
++
++def evaluate_check(fine_density, check_density, tolerance):
++    """
++    判断 5ns 续跑后密度是否相对 fine 收敛密度变化超过 tolerance。
++
++    返回 (passed, relative_change)。
++    """
++    if fine_density is None or fine_density == 0:
++        fail("fine_density 缺失或为 0，无法评估 check 密度变化。")
++
++    relative_change = abs(
++        float(check_density) - float(fine_density)
++    ) / float(fine_density)
++
++    return relative_change <= float(tolerance), relative_change
++
++
++def save_check_result(
++    solvent_root,
++    state,
++    round_idx,
++    check_density,
++    begin_ps,
++    relative_change,
++    passed,
++    final=False,
++):
++    """
++    把第 round_idx 轮 check 结果写回 final_density_result.json 与 state。
++
++    final=True 表示该轮通过（passed=True）或已超过最大重试次数，
++    会同步更新 state["check_status"]。
++    """
++    measurement = {
++        "round": round_idx,
++        "measured_at": now_string(),
++        "directory": state["fine_directory"],
++        "xtc": f"first/{CHECK_XTC_PREFIX}r{round_idx}.xtc",
++        "xvg": f"first/{CHECK_XVG_PREFIX}r{round_idx}.xvg",
++        "begin_ps": round(begin_ps, 3),
++        "density": float(check_density),
++        "fine_density": float(state["fine_density"]),
++        "relative_change": float(relative_change),
++        "tolerance": float(state["check_tolerance"]),
++        "passed": bool(passed),
++    }
++
++    state["check_measurements"].append(measurement)
++    state["check_round"] = round_idx
++
++    if passed:
++        state["check_status"] = "passed"
++    elif final:
++        state["check_status"] = "max_retries_exceeded"
++    else:
++        state["check_status"] = "running"
++
+     save_state(solvent_root, state)
+ 
++    # 同步写回 final_density_result.json
++    result_path = Path(solvent_root) / FINAL_RESULT_JSON
++    if result_path.is_file():
++        try:
++            result = json.loads(
++                result_path.read_text(encoding="utf-8")
++            )
++        except Exception:
++            result = {}
++    else:
++        result = {}
++
++    result["check_status"] = state["check_status"]
++    result["check_round"] = state["check_round"]
++    result["check_tolerance"] = state["check_tolerance"]
++    result["check_max_retries"] = state["check_max_retries"]
++    result["check_extra_ns"] = state["check_extra_ns"]
++    result["fine_density"] = state["fine_density"]
++    result["check_measurements"] = state["check_measurements"]
++    result["last_check"] = measurement
++
++    result_path.write_text(
++        json.dumps(result, indent=4, ensure_ascii=False),
++        encoding="utf-8",
++    )
++
++    print("\n" + "=" * 72)
++    print(f"CHECK ROUND {round_idx} {'PASSED' if passed else 'RETRY'}")
++    print("=" * 72)
++    print(f"Fine density    : {state['fine_density']:.6f}")
++    print(f"Check density   : {check_density:.6f}")
++    print(f"Relative change : {relative_change * 100.0:.4f}%")
++    print(f"Tolerance       : {state['check_tolerance'] * 100.0:.2f}%")
++    print(f"Check status    : {state['check_status']}")
++
++    return measurement
++
++
++def run_post_convergence_check(
++    solvent_root,
++    state,
++    nvt_mdp,
++    collection_root,
++    mof_name,
++    solvent,
++):
++    """
++    fine 收敛后的 5ns 续跑 + 重新校验密度主循环。
++
++    状态机：
++        check_status == "passed"           -> 直接返回，不重跑
++        check_status == "max_retries_exceeded" -> 告警退出
++        check_status in (pending, running)  -> 从 check_round 开始继续
++
++    每轮：
++        1. 调 extend_nvt_for_check 续算 5ns
++        2. 调 run_check_density 统计新增 5ns 段密度
++        3. |ρ_check - ρ_fine| / ρ_fine > 1% -> 下一轮（基于本轮 cpt 续算）
++        4. 否则 -> check_passed，更新 density_profiles.csv 与 final_density_result.json
++        5. 最多 CHECK_MAX_RETRIES 轮
++    """
++    check_status = state.get("check_status", "pending")
++    max_retries = int(state.get("check_max_retries", CHECK_MAX_RETRIES))
++
++    if check_status == "passed":
++        print("\n" + "=" * 72)
++        print("POST-CONVERGENCE CHECK ALREADY PASSED")
++        print("=" * 72)
++        print(f"Check rounds    : {state.get('check_round', 0)}")
++        print(f"Fine density    : {state.get('fine_density')}")
++        if state.get("check_measurements"):
++            last = state["check_measurements"][-1]
++            print(f"Last check rho  : {last['density']:.6f}")
++            print(
++                f"Last change     : "
++                f"{last['relative_change'] * 100.0:.4f}%"
++            )
++        print(f"Result file     : {Path(solvent_root) / FINAL_RESULT_JSON}")
++        return
++
++    if check_status == "max_retries_exceeded":
++        warn(
++            "此前 5ns check 已达到最大重试次数仍未稳定。\n"
++            f"如需重新开始 check，请删除或编辑 "
++            f"{Path(solvent_root) / FINAL_RESULT_JSON} 与 "
++            f"{Path(solvent_root) / STATE_JSON} 中的 check_* 字段。"
++        )
++        return
++
++    # 兼容旧 state（改造前已收敛的体系）：fine_density / fine_directory 缺失。
++    # 优先从 final_density_result.json 回填，其次从 measurements 最后一条回填。
++    # fine_directory 必须指向 <solvent_root>/fine/ 快照目录（续算在此进行），
++    # 不是原始 trial 目录。
++    if state.get("fine_density") is None or state.get("fine_directory") is None:
++        backfilled = False
++
++        # 1. 从 final_density_result.json 回填
++        result_path = Path(solvent_root) / FINAL_RESULT_JSON
++        if result_path.is_file():
++            try:
++                result = json.loads(
++                    result_path.read_text(encoding="utf-8")
++                )
++            except Exception:
++                result = {}
++
++            if state.get("fine_density") is None:
++                rho = result.get("density")
++                if rho is not None:
++                    try:
++                        state["fine_density"] = float(rho)
++                        backfilled = True
++                    except (TypeError, ValueError):
++                        pass
++
++            # fine_directory 优先用 snapshot_directory（指向 fine/ 快照），
++            # 而不是 directory（指向原始 trial 目录）。
++            if state.get("fine_directory") is None:
++                d = result.get("snapshot_directory")
++                if d:
++                    state["fine_directory"] = str(d)
++                    backfilled = True
++
++        # 2. 从 measurements 最后一条回填 fine_density
++        if state.get("fine_density") is None and state.get("measurements"):
++            last = state["measurements"][-1]
++            rho = last.get("density")
++            if rho is not None:
++                try:
++                    state["fine_density"] = float(rho)
++                    backfilled = True
++                except (TypeError, ValueError):
++                    pass
++
++        # 3. fine_directory 兜底：从 solvent_root 拼 <solvent_root>/fine/
++        if state.get("fine_directory") is None:
++            candidate = Path(solvent_root) / FINE_SNAPSHOT_DIR
++            if candidate.is_dir():
++                state["fine_directory"] = str(candidate.resolve())
++                backfilled = True
++
++        if backfilled:
++            save_state(solvent_root, state)
++            print(
++                "\n[backfill] 检测到旧 state 缺 fine_density/fine_directory，"
++                "已从 final_density_result.json 或 solvent_root/fine/ 回填："
++            )
++            print(f"  fine_density    = {state.get('fine_density')}")
++            print(f"  fine_directory  = {state.get('fine_directory')}")
++
++    if state.get("fine_density") is None:
++        fail(
++            "state.fine_density 缺失，且无法从 final_density_result.json "
++            "或 measurements 回填。请检查 "
++            f"{Path(solvent_root) / FINAL_RESULT_JSON} 与 "
++            f"{Path(solvent_root) / STATE_JSON}。"
++        )
++
++    fine_dir = Path(state["fine_directory"]) if state.get("fine_directory") else None
++    if fine_dir is None or not fine_dir.is_dir():
++        fail(
++            f"fine 收敛体系目录不存在或未指定：{fine_dir}\n"
++            "请检查 final_density_result.json 中的 directory 字段。"
++        )
++
++    # 原始 NVT 总时长（ps），作为第 1 轮 check 的 -b 起算时间
++    t0 = original_nvt_end_ps(nvt_mdp)
++    extra_ns = float(state.get("check_extra_ns", CHECK_EXTRA_NS))
++    extra_ps = extra_ns * 1000.0
++
++    # 校验：T0 应不小于原 measure_system 使用的 DENSITY_BEGIN_PS，
++    # 否则说明原 NVT 比预期短，统计区间与原 fine 不一致。
++    if t0 < DENSITY_BEGIN_PS:
++        warn(
++            f"原 NVT 总时长 {t0:.1f} ps 小于原密度统计起始 "
++            f"{DENSITY_BEGIN_PS} ps。这可能导致 check 段密度统计区间"
++            "与原 fine 收敛时不一致，请检查 nvt.mdp 的 nsteps。"
++        )
++
++    print("\n" + "=" * 72)
++    print("POST-CONVERGENCE 5NS CHECK")
++    print("=" * 72)
++    print(f"Fine directory  : {fine_dir}")
++    print(f"Fine density     : {state['fine_density']:.6f}")
++    print(f"Original NVT end : {t0:.1f} ps")
++    print(f"Extra per round  : {extra_ns:.1f} ns ({extra_ps:.1f} ps)")
++    print(f"Tolerance        : {state['check_tolerance'] * 100.0:.2f}%")
++    print(f"Max retries      : {max_retries}")
++
++    # 从 check_round 继续；若 check_round=0 表示尚未开始，从 1 开始
++    start_round = int(state.get("check_round", 0)) + 1
++
++    for round_idx in range(start_round, max_retries + 1):
++        print("\n" + "#" * 72)
++        print(f"# CHECK ROUND {round_idx} / {max_retries}")
++        print("#" * 72)
++
++        # 1. 续算 5ns
++        paths = extend_nvt_for_check(
++            system_dir=fine_dir,
++            nvt_mdp=nvt_mdp,
++            round_idx=round_idx,
++            extra_ns=extra_ns,
++        )
++
++        # 2. 跑密度：begin = t0 + (round_idx - 1) * extra_ps
++        #    第 1 轮只统计原 NVT 之后的 5ns 段；
++        #    第 N 轮只统计第 N 轮新增的 5ns 段（基于上轮 cpt 续算）。
++        begin_ps = t0 + (round_idx - 1) * extra_ps
++
++        xvg = run_check_density(
++            system_dir=fine_dir,
++            round_idx=round_idx,
++            begin_ps=begin_ps,
++        )
++
++        # 3. 解析密度（只取 18~22 nm 区间，与 measure_system 一致）
++        summary, _ = load_summary(fine_dir)
++        density_analysis = analyze_density_profile(
++            xvg_path=xvg,
++            summary=summary,
++            target_density=float(state["target_density"]),
++        )
++        check_density = density_analysis["bulk_density"]
++
++        # 4. 判断
++        passed, relative_change = evaluate_check(
++            fine_density=float(state["fine_density"]),
++            check_density=check_density,
++            tolerance=state["check_tolerance"],
++        )
++
++        is_final = passed or (round_idx >= max_retries)
++        save_check_result(
++            solvent_root=solvent_root,
++            state=state,
++            round_idx=round_idx,
++            check_density=check_density,
++            begin_ps=begin_ps,
++            relative_change=relative_change,
++            passed=passed,
++            final=is_final,
++        )
++
++        # 同步更新全局 density_profiles.csv，便于跨体系查看
++        update_global_density_csv(
++            collection_root=collection_root,
++            mof_name=mof_name,
++            solvent=solvent,
++            system_dir=fine_dir,
++            system_name=str(state.get("check_round", 0)),
++            density=check_density,
++            points=density_analysis["bulk_points"],
++        )
++
++        if passed:
++            print("\n" + "=" * 72)
++            print("POST-CONVERGENCE CHECK PASSED")
++            print("=" * 72)
++            print(
++                f"5ns 续跑后密度变化 {relative_change * 100.0:.4f}% "
++                f"<= {state['check_tolerance'] * 100.0:.2f}%，"
++                "体系已确认稳定。"
++            )
++            print(f"Result file     : {Path(solvent_root) / FINAL_RESULT_JSON}")
++            return
++
++    # 已达最大重试仍未通过
++    print("\n" + "=" * 72)
++    print("POST-CONVERGENCE CHECK MAX RETRIES EXCEEDED")
++    print("=" * 72)
++    warn(
++        f"已续跑 {max_retries} 轮 5ns（共 {max_retries * extra_ns:.1f} ns），"
++        "密度仍未相对 fine 收敛值稳定在 1% 以内。\n"
++        "结果已记录为 max_retries_exceeded，请人工检查体系。"
++    )
++    print(f"Result file     : {Path(solvent_root) / FINAL_RESULT_JSON}")
++
+ 
+ def distinct_measurements_by_emim(state):
+     mapping = {}
+@@ -2048,8 +2773,20 @@ def main():
+     print(f"State file         : {state_path(solvent_root)}")
+ 
+     if state.get("status") == "converged":
+-        print("\n已有状态显示体系已经收敛。")
++        # 已收敛的体系，重新运行时进入 5ns check 流程：
++        #   - check 已通过：直接报告完成
++        #   - check 已达最大重试：告警退出
++        #   - check 未完成：从中断点继续
++        print("\n已有状态显示体系已经收敛，进入 5ns 续跑校验流程。")
+         print(f"结果文件：{Path(solvent_root) / FINAL_RESULT_JSON}")
++        run_post_convergence_check(
++            solvent_root=solvent_root,
++            state=state,
++            nvt_mdp=nvt_mdp,
++            collection_root=collection_root,
++            mof_name=mof_dir.name,
++            solvent=solvent,
++        )
+         return
+ 
+     current_trial = Path(
+@@ -2100,6 +2837,16 @@ def main():
+                 f"Final result file: "
+                 f"{Path(solvent_root) / FINAL_RESULT_JSON}"
+             )
++
++            # fine 收敛后，进入 5ns 续跑 + 重新校验密度流程
++            run_post_convergence_check(
++                solvent_root=solvent_root,
++                state=state,
++                nvt_mdp=nvt_mdp,
++                collection_root=collection_root,
++                mof_name=mof_dir.name,
++                solvent=solvent,
++            )
+             return
+ 
+         # 4. 预测下一体系
