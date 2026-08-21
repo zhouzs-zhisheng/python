@@ -1741,10 +1741,16 @@ def extend_nvt_for_check(
     else:
         print(f"第 {round_idx} 轮 tpr 已存在，跳过 convert-tpr：{paths['tpr']}")
 
-    # gmx mdrun -s first/nvt_check_rN.tpr -cpi <base_cpt>
+    # gmx mdrun -s first/nvt_check_rN.tpr -cpi <base_cpt> -noappend
     #            -deffnm first/nvt_check_rN
-    # -cpi 必须用相对于 cwd(system_dir) 的路径，否则会找不到 checkpoint
-    # 而从 tpr 起始 step 重新开始模拟（即从头跑完整时长，而非续算）。
+    # 关键 GROMACS 续跑要求（参考 ensure_nvt 的 -append 机制）：
+    #   -cpi 默认走 append 模式，要求 -deffnm 与原模拟一致（first/nvt），
+    #       并追加到原 first/nvt.xtc 等输出文件；
+    #   - 但 check 每轮需要独立命名（first/nvt_check_rN.*），不污染原轨迹，
+    #     所以必须用 -noappend：从 checkpoint 的 step 续算，
+    #     但用 -deffnm 指定的新名字写新输出文件。
+    #   - -cpi 必须用相对于 cwd(system_dir) 的路径，否则会找不到 checkpoint
+    #     而从 tpr 起始 step 重新开始模拟（即从头跑完整时长，而非续算）。
     try:
         cpt_arg = str(base_cpt.relative_to(system_dir))
     except ValueError:
@@ -1755,6 +1761,7 @@ def extend_nvt_for_check(
         "gmx", "mdrun",
         "-s", f"first/{CHECK_TPR_PREFIX}r{round_idx}.tpr",
         "-cpi", cpt_arg,
+        "-noappend",
         "-deffnm", f"first/{CHECK_TPR_PREFIX}r{round_idx}",
         "-v",
         "-ntomp", str(NTOMP),
