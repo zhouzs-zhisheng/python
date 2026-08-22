@@ -1,5 +1,5 @@
 diff --git a/adjust_density.py b/adjust_density.py
-index a13777f..c6be6f8 100644
+index a13777f..7aaad77 100644
 --- a/adjust_density.py
 +++ b/adjust_density.py
 @@ -171,6 +171,43 @@ MOF 总目录：
@@ -81,7 +81,7 @@ index a13777f..c6be6f8 100644
  # 真空判据：
  # 某个允许电解液存在的 Z 区域内，如果连续至少两个 density slice
  # 低于目标密度的 1%，则认为存在局部真空/断层。
-@@ -409,7 +474,41 @@ def new_state(solvent, mof_name, target_density, initial_system_dir):
+@@ -409,7 +474,50 @@ def new_state(solvent, mof_name, target_density, initial_system_dir):
          "current_trial_dir": str(Path(initial_system_dir).resolve()),
          "coarse_checkpoint": None,
          "measurements": [],
@@ -94,7 +94,10 @@ index a13777f..c6be6f8 100644
 +        "check_status": "pending",
 +        "check_round": 0,            # 已开始/已完成的 round 数
 +        "fine_density": None,        # fine 收敛时记录的 ρ_fine
-+        "fine_directory": None,      # fine 收敛体系目录
++        # 注意：fine_directory 仅作为向后兼容展示写入；运行时真正用的
++        # 是 check_snapshot_rel（相对 solvent_root 的快照子目录，如 "fine"）。
++        "fine_directory": None,
++        "check_snapshot_rel": None,  # 5ns check 快照子目录名（相对 solvent_root）
 +        "check_tolerance": CHECK_TOLERANCE,
 +        "check_max_retries": CHECK_MAX_RETRIES,
 +        "check_extra_ns": CHECK_EXTRA_NS,
@@ -109,6 +112,12 @@ index a13777f..c6be6f8 100644
 +        "check_round": 0,
 +        "fine_density": None,
 +        "fine_directory": None,
++        # check_snapshot_rel 是 5ns check 无歧义的运行时快照子目录名。
++        # 相对 solvent_root，例如 "fine"、"440"。
++        # 即使 fine_directory 保存了历史脏值（如 solvent_root 本身），
++        # 进入 run_post_convergence_check 时 resolve_check_runtime
++        # 也会重新解析并正确写入此字段。
++        "check_snapshot_rel": None,
 +        "check_tolerance": CHECK_TOLERANCE,
 +        "check_max_retries": CHECK_MAX_RETRIES,
 +        "check_extra_ns": CHECK_EXTRA_NS,
@@ -123,7 +132,7 @@ index a13777f..c6be6f8 100644
  
  
  def state_path(solvent_root):
-@@ -457,6 +556,10 @@ def load_or_create_state(
+@@ -457,6 +565,10 @@ def load_or_create_state(
                  "如要重新开始，请使用 --reset-state。"
              )
  
@@ -134,7 +143,7 @@ index a13777f..c6be6f8 100644
          return state
  
      state = new_state(
-@@ -1429,6 +1532,17 @@ def save_final_result(solvent_root, state, measurement):
+@@ -1429,6 +1541,17 @@ def save_final_result(solvent_root, state, measurement):
          "vacuum_detected": measurement.get("vacuum_detected", False),
          "vacuum_fraction": measurement.get("vacuum_fraction", 0.0),
          "coarse_checkpoint": state.get("coarse_checkpoint"),
@@ -152,7 +161,7 @@ index a13777f..c6be6f8 100644
      }
  
      path = Path(solvent_root) / FINAL_RESULT_JSON
-@@ -1440,9 +1554,699 @@ def save_final_result(solvent_root, state, measurement):
+@@ -1440,9 +1563,792 @@ def save_final_result(solvent_root, state, measurement):
  
      state["status"] = "converged"
      state["current_trial_dir"] = measurement["directory"]
@@ -239,56 +248,213 @@ index a13777f..c6be6f8 100644
 +    return nsteps * dt
 +
 +
-+def check_round_files(system_dir, round_idx):
++def check_round_files(runtime_root, snapshot_rel, round_idx):
 +    """
 +    返回第 round_idx 轮 check 的所有产物路径。
 +
++    参数：
++        runtime_root : 所有 gmx 命令的 cwd 根，统一为 solvent_root
++                       （如 <MOF>/ACN/ 或 <MOF>/PC/）。
++        snapshot_rel : 相对于 runtime_root 的 fine 快照子目录名，
++                       通常是 "fine"；兼容旧 trial 体系时可能是
++                       数字目录名（如 "440"）。
++                       所有 first/ 下的文件都在：
++                           <runtime_root>/<snapshot_rel>/first/
++                       runtime_root 目录始终是 index.ndx、topol.top
++                       等公共文件的位置。
++
 +    每轮独立命名，便于中断后恢复：
-+        first/nvt_check_r1.tpr / .xtc / .gro / .cpt
-+        first/density_check_r1.xvg
++        <snapshot_rel>/first/nvt_check_r1.tpr / .xtc / .gro / .cpt
++        <snapshot_rel>/first/density_check_r1.xvg
 +    """
-+    first = Path(system_dir) / "first"
++    runtime_root = Path(runtime_root)
++    snapshot = runtime_root / snapshot_rel
++    first_snapshot = snapshot / "first"
 +    suffix = f"r{round_idx}"
 +    return {
-+        "tpr":  first / f"{CHECK_TPR_PREFIX}{suffix}.tpr",
-+        "xtc":  first / f"{CHECK_XTC_PREFIX}{suffix}.xtc",
-+        "gro":  first / f"{CHECK_GRO_PREFIX}{suffix}.gro",
-+        "cpt":  first / f"{CHECK_CPT_PREFIX}{suffix}.cpt",
-+        "xvg":  first / f"{CHECK_XVG_PREFIX}{suffix}.xvg",
++        "tpr":  first_snapshot / f"{CHECK_TPR_PREFIX}{suffix}.tpr",
++        "xtc":  first_snapshot / f"{CHECK_XTC_PREFIX}{suffix}.xtc",
++        "gro":  first_snapshot / f"{CHECK_GRO_PREFIX}{suffix}.gro",
++        "cpt":  first_snapshot / f"{CHECK_CPT_PREFIX}{suffix}.cpt",
++        "xvg":  first_snapshot / f"{CHECK_XVG_PREFIX}{suffix}.xvg",
++        # 额外信息：本轮的 snapshot 相对路径
++        "_snapshot_rel": str(snapshot_rel),
++        "_first_rel": f"{snapshot_rel}/first",
++        "_runtime_root": runtime_root,
 +    }
 +
 +
++def resolve_check_runtime(solvent_root, state):
++    """
++    统一解析 5ns check 流程运行时的根目录与快照位置。
++
++    约束（来自你的目录约定）：
++        - solvent_root (<MOF>/ACN/ 或 <MOF>/PC/) 是唯一的「运行根目录」。
++          所有 gmx 命令的 cwd 都固定为 solvent_root，不再在 trial/
++          fine/first/ 之间来回切换。
++        - index.ndx / topol.top / system.gro / system_summary.json
++          等公共文件，以及 density_adjustment.json / final_density_result.json
++          都放在 solvent_root 直接目录下（或通过快照子目录访问）。
++
++    解析规则（按优先级，结果必须通过 first/nvt.cpt + nvt.tpr 存在校验）：
++        1) <solvent_root>/fine/first/nvt.cpt   — 标准 fine 快照。
++              对应 snapshot_rel = "fine"。
++        2) final_density_result.json["snapshot_directory"]
++              — 如果是 solvent_root 的子目录，取相对路径作为 snapshot_rel。
++        3) final_density_result.json["directory"]
++              — 同样如果是 solvent_root 的子目录，取相对路径。
++        4) 兼容 state["fine_directory"] 旧格式：
++              - 若它等于 solvent_root 本身（你报告过的历史脏值），
++                则按优先级 1 重算；
++              - 若是 solvent_root 的子目录，取相对路径。
++
++    返回 dict：
++        {
++          "runtime_root": Path(solvent_root),      # 固定 cwd
++          "snapshot_rel": "fine" | "440" | ...     # 相对于 runtime_root 的快照子目录
++          "snapshot_abs": <runtime_root/snapshot_rel>,
++          "first_rel": "fine/first" | ...          # 相对于 runtime_root 的 first 目录
++          "first_abs": <.../fine/first>,
++          "base_tpr_rel": "fine/first/nvt.tpr",
++          "base_cpt_rel": "fine/first/nvt.cpt",
++          "index_rel": "index.ndx",                 # 相对 runtime_root
++          "summary_path": 实际 summary json 路径 (snapshot/system_summary.json 或 runtime_root/system_summary.json)
++          "resolved_from": 来源字符串 (用于打印)
++        }
++
++    如果所有规则都找不到 first/nvt.cpt 和 nvt.tpr，则 fail 并给出具体排查清单。
++    """
++    solvent_root = Path(solvent_root).resolve()
++
++    # 预读 final_result（如存在）
++    final_result = {}
++    final_result_path = solvent_root / FINAL_RESULT_JSON
++    if final_result_path.is_file():
++        try:
++            final_result = json.loads(
++                final_result_path.read_text(encoding="utf-8")
++            )
++        except Exception:
++            final_result = {}
++
++    def _candidate_from_abs(abs_path, label):
++        """把绝对路径 candidate 转成 (snapshot_rel, first_abs, tpr, cpt) 四元组。"""
++        abs_path = Path(abs_path).resolve()
++        first_abs = abs_path / "first"
++        tpr = first_abs / "nvt.tpr"
++        cpt = first_abs / "nvt.cpt"
++        try:
++            snapshot_rel = str(abs_path.relative_to(solvent_root))
++        except ValueError:
++            # 不在 solvent_root 子树下：不接受，避免再次出现多 cwd 切换。
++            return None
++        if tpr.is_file() and cpt.is_file():
++            return snapshot_rel, first_abs, tpr, cpt, label
++        return None
++
++    candidates = []
++
++    # 1) 标准 solvent_root/fine/
++    std = _candidate_from_abs(solvent_root / FINE_SNAPSHOT_DIR,
++                              f"solvent_root/{FINE_SNAPSHOT_DIR}")
++    if std is not None:
++        candidates.append(std)
++
++    # 2) final_result["snapshot_directory"]
++    snap_dir = final_result.get("snapshot_directory")
++    if snap_dir:
++        c = _candidate_from_abs(snap_dir, "final_result:snapshot_directory")
++        if c is not None:
++            candidates.append(c)
++
++    # 3) final_result["directory"]
++    dirv = final_result.get("directory")
++    if dirv:
++        c = _candidate_from_abs(dirv, "final_result:directory")
++        if c is not None:
++            candidates.append(c)
++
++    # 4) state["fine_directory"]（兼容旧格式；注意：如果等于 solvent_root，
++    #    就跳过——说明是历史脏值，会再次选中 ACN/ 本身）
++    fdir = state.get("fine_directory")
++    if fdir and Path(fdir).resolve() != solvent_root:
++        c = _candidate_from_abs(fdir, "state:fine_directory")
++        if c is not None:
++            candidates.append(c)
++
++    if not candidates:
++        fail(
++            "找不到可用于 5ns check 的 fine 快照目录。所有候选路径都没有同时包含\n"
++            "   first/nvt.tpr 和 first/nvt.cpt。\n"
++            f"当前 solvent_root = {solvent_root}\n"
++            "尝试过的候选（按优先级）：\n"
++            f"  1) {solvent_root / FINE_SNAPSHOT_DIR}\n"
++            f"  2) final_density_result.json[snapshot_directory] = {snap_dir}\n"
++            f"  3) final_density_result.json[directory] = {dirv}\n"
++            f"  4) state[fine_directory] = {fdir}\n"
++            "请确认 fine/ 快照存在且包含 first/nvt.tpr 和 first/nvt.cpt。"
++        )
++
++    # 选中第一个命中的（按优先级）
++    snapshot_rel, first_abs, tpr_abs, cpt_abs, src_label = candidates[0]
++    first_rel = f"{snapshot_rel}/first"
++
++    # 优先 summary：snapshot 目录里的 summary.json（如果是整目录复制一定有），
++    # 否则回退到 solvent_root 下的 summary（初始 base 体系场景）。
++    snap_summary = solvent_root / snapshot_rel / "system_summary.json"
++    root_summary = solvent_root / "system_summary.json"
++    if snap_summary.is_file():
++        summary_path = snap_summary
++    elif root_summary.is_file():
++        summary_path = root_summary
++    else:
++        fail(
++            "找不到 system_summary.json（需要用于密度 Z 区间解析）。\n"
++            f"检查过：{snap_summary} 和 {root_summary}"
++        )
++
++    runtime = {
++        "runtime_root": solvent_root,
++        "snapshot_rel": snapshot_rel,
++        "snapshot_abs": solvent_root / snapshot_rel,
++        "first_rel": first_rel,
++        "first_abs": first_abs,
++        "base_tpr_rel": f"{first_rel}/nvt.tpr",
++        "base_cpt_rel": f"{first_rel}/nvt.cpt",
++        "index_rel": "index.ndx",
++        "summary_path": summary_path,
++        "resolved_from": src_label,
++    }
++    return runtime
++
++
 +def extend_nvt_for_check(
-+    system_dir,
++    runtime_root,
++    snapshot_rel,
 +    nvt_mdp,
 +    round_idx,
 +    extra_ns,
-+    base_cpt=None,
 +):
 +    """
-+    在 fine 收敛体系的 NVT 基础上续算 extra_ns 纳秒。
++    在 fine 快照体系的 NVT 基础上续算 extra_ns ns。
 +
-+    使用 gmx convert-tpr -extend 把 tpr 的总步数延长 extra_ns/dt 步，
-+    再用 mdrun -cpi 从上一轮的 cpt（或原 nvt.cpt）续算。
++    **关键约束**：所有 gmx 命令的 cwd 都固定为 runtime_root
++    （即 solvent_root，如 ACN/），所有文件路径都用相对路径表达，
++    不再在 trial/fine/first 之间来回切换。
 +
-+    参数：
-+        system_dir : fine 收敛体系目录
-+        nvt_mdp    : 原 nvt.mdp（用于解析 dt）
-+        round_idx  : 当前轮次（1 起）
-+        extra_ns   : 本轮续算时长（ns）
-+        base_cpt   : 续算起点的 cpt；None 时按 round_idx 自动选择
-+                     round 1 -> first/nvt.cpt
-+                     round N -> first/nvt_check_r(N-1).cpt
++    流程：
++        1) gmx convert-tpr 把 <snapshot_rel>/first/nvt.tpr extend extra_ns
++           → <snapshot_rel>/first/nvt_check_rN.tpr
++        2) gmx mdrun -cpi 基于 base_cpt 续算，
++           round 1 基于 <snapshot_rel>/first/nvt.cpt；
++           round N 基于 <snapshot_rel>/first/nvt_check_r(N-1).cpt。
++           使用 -noappend，不污染原 nvt.* 输出。
 +
 +    可重复性：
-+        若本轮 tpr+xtc+gro+cpt 都已存在，直接跳过续算；
-+        若只 tpr 缺失但其它都存在，视为异常，fail。
++        若本轮 tpr+xtc+gro+cpt 都已存在，直接跳过续算。
 +    """
-+    system_dir = Path(system_dir)
-+    first = system_dir / "first"
-+    first.mkdir(exist_ok=True)
-+
-+    paths = check_round_files(system_dir, round_idx)
++    runtime_root = Path(runtime_root).resolve()
++    paths = check_round_files(runtime_root, snapshot_rel, round_idx)
 +
 +    # 已完整生成则跳过
 +    if (
@@ -306,26 +472,28 @@ index a13777f..c6be6f8 100644
 +    # 解析 dt
 +    _, dt = parse_mdp_nsteps_dt(nvt_mdp)
 +    extend_ps = float(extra_ns) * 1000.0
-+    extend_steps = int(round(extend_ps / dt))
 +
-+    # 自动选择 base cpt
-+    if base_cpt is None:
-+        if round_idx == 1:
-+            base_cpt = first / "nvt.cpt"
-+        else:
-+            prev = check_round_files(system_dir, round_idx - 1)
-+            base_cpt = prev["cpt"]
++    # 自动选择 base cpt（相对 runtime_root）
++    first_rel = paths["_first_rel"]
++    if round_idx == 1:
++        base_cpt_rel = f"{first_rel}/nvt.cpt"
 +    else:
-+        base_cpt = Path(base_cpt)
-+
-+    if not base_cpt.is_file():
++        prev_paths = check_round_files(runtime_root, snapshot_rel, round_idx - 1)
++        base_cpt_rel = str(
++            prev_paths["cpt"].relative_to(runtime_root)
++        )
++    base_cpt_abs = runtime_root / base_cpt_rel
++    if not base_cpt_abs.is_file():
 +        fail(
-+            f"找不到续算起点 cpt：{base_cpt}\n"
-+            f"请确认原 NVT 已完成（first/nvt.cpt 存在）。"
++            f"找不到续算起点 cpt：{base_cpt_abs}\n"
++            "请确认原 NVT 已完成（fine/first/nvt.cpt 存在）。"
 +        )
 +
-+    # gmx convert-tpr -s first/nvt.tpr -extend <ps> -o first/nvt_check_rN.tpr
-+    # 注意：convert-tpr 的 -extend 单位是 ps。
++    base_tpr_rel = f"{first_rel}/nvt.tpr"
++    tpr_rel = str(paths["tpr"].relative_to(runtime_root))
++    deffnm_rel = f"{first_rel}/{CHECK_TPR_PREFIX}r{round_idx}"
++
++    # gmx convert-tpr -extend 单位是 ps。
 +    if not paths["tpr"].is_file():
 +        print(
 +            f"\n[convert-tpr] 续算 {extend_ps:.1f} ps "
@@ -334,37 +502,26 @@ index a13777f..c6be6f8 100644
 +        run_command(
 +            [
 +                "gmx", "convert-tpr",
-+                "-s", "first/nvt.tpr",
++                "-s", base_tpr_rel,
 +                "-extend", f"{extend_ps:.1f}",
-+                "-o", str(paths["tpr"].relative_to(system_dir)),
++                "-o", tpr_rel,
 +            ],
-+            cwd=system_dir,
++            cwd=runtime_root,
 +        )
 +    else:
 +        print(f"第 {round_idx} 轮 tpr 已存在，跳过 convert-tpr：{paths['tpr']}")
 +
-+    # gmx mdrun -s first/nvt_check_rN.tpr -cpi <base_cpt> -noappend
-+    #            -deffnm first/nvt_check_rN
-+    # 关键 GROMACS 续跑要求（参考 ensure_nvt 的 -append 机制）：
-+    #   -cpi 默认走 append 模式，要求 -deffnm 与原模拟一致（first/nvt），
-+    #       并追加到原 first/nvt.xtc 等输出文件；
-+    #   - 但 check 每轮需要独立命名（first/nvt_check_rN.*），不污染原轨迹，
-+    #     所以必须用 -noappend：从 checkpoint 的 step 续算，
-+    #     但用 -deffnm 指定的新名字写新输出文件。
-+    #   - -cpi 必须用相对于 cwd(system_dir) 的路径，否则会找不到 checkpoint
-+    #     而从 tpr 起始 step 重新开始模拟（即从头跑完整时长，而非续算）。
-+    try:
-+        cpt_arg = str(base_cpt.relative_to(system_dir))
-+    except ValueError:
-+        # base_cpt 不在 system_dir 下，用绝对路径
-+        cpt_arg = str(base_cpt)
-+
++    # gmx mdrun：
++    #   * cwd = runtime_root（固定 solvent_root）
++    #   * -s / -deffnm 都相对 runtime_root 表达
++    #   * -cpi 同样相对 runtime_root（保证找到 checkpoint）
++    #   * -noappend：沿用 checkpoint step 但写新的 nvt_check_rN.* 文件
 +    cmd = [
 +        "gmx", "mdrun",
-+        "-s", f"first/{CHECK_TPR_PREFIX}r{round_idx}.tpr",
-+        "-cpi", cpt_arg,
++        "-s", tpr_rel,
++        "-cpi", base_cpt_rel,
 +        "-noappend",
-+        "-deffnm", f"first/{CHECK_TPR_PREFIX}r{round_idx}",
++        "-deffnm", deffnm_rel,
 +        "-v",
 +        "-ntomp", str(NTOMP),
 +        "-ntmpi", str(NTMPI),
@@ -372,9 +529,11 @@ index a13777f..c6be6f8 100644
 +
 +    print(
 +        f"[mdrun] 续算 {extend_ps:.1f} ps，"
-+        f"基于 cpt {base_cpt} -> {paths['gro']}"
++        f"基于 cpt {base_cpt_rel} "
++        f"(cwd={runtime_root}) "
++        f"-> {paths['gro']}"
 +    )
-+    run_command(cmd, cwd=system_dir)
++    run_command(cmd, cwd=runtime_root)
 +
 +    for key in ("gro", "xtc", "cpt"):
 +        if not paths[key].is_file():
@@ -385,24 +544,28 @@ index a13777f..c6be6f8 100644
 +    return paths
 +
 +
-+def run_check_density(system_dir, round_idx, begin_ps):
++def run_check_density(runtime_root, snapshot_rel, round_idx, begin_ps):
 +    """
 +    对第 round_idx 轮续算得到的 nvt_check_rN.xtc 跑 gmx density，
 +    只统计 t >= begin_ps 之后的密度。
++
++    **关键约束**：所有 gmx 命令 cwd 固定为 runtime_root（solvent_root）。
++    与 run_density 原有实现（cwd=first, -n ../index.ndx）区分，
++    这里直接以 runtime_root 为根，文件全部用相对路径表达。
 +
 +    自动选择 group 6（与原 measure_system 保持一致）。
 +
 +    可重复性：
 +        若 density_check_rN.xvg 已存在，直接复用。
 +    """
-+    system_dir = Path(system_dir)
-+    first = system_dir / "first"
-+    paths = check_round_files(system_dir, round_idx)
++    runtime_root = Path(runtime_root).resolve()
++    paths = check_round_files(runtime_root, snapshot_rel, round_idx)
 +
 +    xtc = paths["xtc"]
 +    tpr = paths["tpr"]
 +    xvg = paths["xvg"]
-+    index = system_dir / "index.ndx"
++    # index.ndx 默认就放在 runtime_root 下（即 solvent_root）
++    index = runtime_root / "index.ndx"
 +
 +    if xvg.is_file():
 +        print(f"第 {round_idx} 轮 check 密度已存在，复用：{xvg}")
@@ -412,18 +575,23 @@ index a13777f..c6be6f8 100644
 +        if not p.is_file():
 +            fail(f"check density 输入文件不存在：{p}")
 +
++    xtc_rel = str(xtc.relative_to(runtime_root))
++    tpr_rel = str(tpr.relative_to(runtime_root))
++    xvg_rel = str(xvg.relative_to(runtime_root))
++    index_rel = str(index.relative_to(runtime_root))
++
 +    run_command(
 +        [
 +            "gmx", "density",
-+            "-f", f"first/{CHECK_XTC_PREFIX}r{round_idx}.xtc",
-+            "-s", f"first/{CHECK_TPR_PREFIX}r{round_idx}.tpr",
-+            "-n", "../index.ndx",
++            "-f", xtc_rel,
++            "-s", tpr_rel,
++            "-n", index_rel,
 +            "-sl", str(DENSITY_SLICES),
-+            "-o", f"first/{CHECK_XVG_PREFIX}r{round_idx}.xvg",
++            "-o", xvg_rel,
 +            "-d", "Z",
 +            "-b", f"{begin_ps:.1f}",
 +        ],
-+        cwd=first,
++        cwd=runtime_root,
 +        stdin_text=f"{DENSITY_GROUP}\n",
 +    )
 +
@@ -462,15 +630,32 @@ index a13777f..c6be6f8 100644
 +    """
 +    把第 round_idx 轮 check 结果写回 final_density_result.json 与 state。
 +
++    新增的无歧义关键字段：
++        state["check_snapshot_rel"]
++            — 相对于 solvent_root 的快照子目录名，例如 "fine" 或 "440"。
++              5ns check 的所有产物都写入：
++                 <solvent_root>/<check_snapshot_rel>/first/
++              不再用 fine_directory（可能是历史脏值，或指向 solvent_root 本身）。
++
++    measurement["xtc"] / ["xvg"] 也会记录为相对 solvent_root 的完整路径，
++    避免歧义（例如 fine/first/nvt_check_r1.xtc）。
++
 +    final=True 表示该轮通过（passed=True）或已超过最大重试次数，
 +    会同步更新 state["check_status"]。
 +    """
++    snapshot_rel = state.get("check_snapshot_rel") or FINE_SNAPSHOT_DIR
++    xtc_rel = f"{snapshot_rel}/first/{CHECK_XTC_PREFIX}r{round_idx}.xtc"
++    xvg_rel = f"{snapshot_rel}/first/{CHECK_XVG_PREFIX}r{round_idx}.xvg"
++    snap_abs = str(Path(solvent_root) / snapshot_rel)
++
 +    measurement = {
 +        "round": round_idx,
 +        "measured_at": now_string(),
-+        "directory": state["fine_directory"],
-+        "xtc": f"first/{CHECK_XTC_PREFIX}r{round_idx}.xtc",
-+        "xvg": f"first/{CHECK_XVG_PREFIX}r{round_idx}.xvg",
++        "snapshot_rel": snapshot_rel,
++        "snapshot_abs": snap_abs,
++        "directory": snap_abs,              # 向后兼容
++        "xtc": xtc_rel,                      # 相对 solvent_root（无歧义）
++        "xvg": xvg_rel,                      # 相对 solvent_root
 +        "begin_ps": round(begin_ps, 3),
 +        "density": float(check_density),
 +        "fine_density": float(state["fine_density"]),
@@ -479,6 +664,7 @@ index a13777f..c6be6f8 100644
 +        "passed": bool(passed),
 +    }
 +
++    state["check_snapshot_rel"] = snapshot_rel
 +    state["check_measurements"].append(measurement)
 +    state["check_round"] = round_idx
 +
@@ -509,6 +695,7 @@ index a13777f..c6be6f8 100644
 +    result["check_max_retries"] = state["check_max_retries"]
 +    result["check_extra_ns"] = state["check_extra_ns"]
 +    result["fine_density"] = state["fine_density"]
++    result["check_snapshot_rel"] = state.get("check_snapshot_rel")
 +    result["check_measurements"] = state["check_measurements"]
 +    result["last_check"] = measurement
 +
@@ -540,18 +727,32 @@ index a13777f..c6be6f8 100644
 +    """
 +    fine 收敛后的 5ns 续跑 + 重新校验密度主循环。
 +
++    关键目录约定（与你的目录体系保持一致）：
++        solvent_root（如 <MOF>/ACN/ 或 <MOF>/PC/）是唯一的运行根目录。
++        5ns check 的所有 gmx 命令都以 solvent_root 为 cwd 统一执行，
++        输出文件通过相对路径定位到：
++            <solvent_root>/<check_snapshot_rel>/first/
++        其中 check_snapshot_rel 默认是 "fine"（copy_system_snapshot
++        生成的标准快照目录），兼容旧 trial 目录（如 "440"）。
++
++    不再在 fine/、trial/、first/ 之间切换 cwd，也不再依赖语义
++    歧义的 state["fine_directory"]（它在历史脏值里可能等于 solvent_root
++    本身，而真正想表达的是 fine 快照目录）。取而代之的是：
++        state["check_snapshot_rel"]  — 无歧义的相对路径名
++
 +    状态机：
-+        check_status == "passed"           -> 直接返回，不重跑
++        check_status == "passed"              -> 直接报告完成
 +        check_status == "max_retries_exceeded" -> 告警退出
-+        check_status in (pending, running)  -> 从 check_round 开始继续
++        check_status in (pending, running)    -> 从 check_round 继续
 +
 +    每轮：
-+        1. 调 extend_nvt_for_check 续算 5ns
-+        2. 调 run_check_density 统计新增 5ns 段密度
-+        3. |ρ_check - ρ_fine| / ρ_fine > 1% -> 下一轮（基于本轮 cpt 续算）
-+        4. 否则 -> check_passed，更新 density_profiles.csv 与 final_density_result.json
++        1. extend_nvt_for_check 续算 5ns（mdrun -cpi + -noappend）
++        2. run_check_density 只统计新增 5ns 段
++        3. |ρ_check - ρ_fine| / ρ_fine > 1% -> 下一轮
++        4. 否则 -> check_passed，记录
 +        5. 最多 CHECK_MAX_RETRIES 轮
 +    """
++    solvent_root = Path(solvent_root).resolve()
 +    check_status = state.get("check_status", "pending")
 +    max_retries = int(state.get("check_max_retries", CHECK_MAX_RETRIES))
 +
@@ -580,168 +781,66 @@ index a13777f..c6be6f8 100644
 +        )
 +        return
 +
-+    # --------------------------------------------------------------
-+    # 强制重新解析 fine_density / fine_directory（不信任 state 缓存）
-+    # --------------------------------------------------------------
-+    # 历史版本的 fine_directory 可能被错误保存为 solvent_root 或
-+    # 原始 trial 目录，导致 5ns check 续算产物写到错误位置
-+    # （如 ACN/first/ 而不是 ACN/fine/first/）。因此每次进入 check
-+    # 流程都强制从可信来源重新解析并覆盖 state 中的值。
-+    #
-+    # 可信优先级：
-+    #   1) final_density_result.json["snapshot_directory"]
-+    #   2) <solvent_root>/fine/ 目录（copy_system_snapshot 的标准位置）
-+    #   3) final_density_result.json["directory"]（原始 trial 目录，
-+    #      需要 first/nvt.cpt 存在且含 snapshot 特征文件）——慎用
-+    #
-+    # fine_directory 最终必须满足：
-+    #   - 是一个真实存在的目录
-+    #   - 包含 first/nvt.cpt（原 NVT checkpoint）
-+    #   - 包含 first/nvt.tpr
-+    #
-+    # 此外 fine_directory 的 "正常" 形式应为 <solvent_root>/fine/。
-+    # 虽然 trial 目录也可能满足 first/nvt.cpt 存在，但续算产物会留在
-+    # trial 目录里、不易找到，因此一旦能找到 solvent_root/fine/
-+    # 就优先用它。
-+    # --------------------------------------------------------------
-+    re_evaluated = False
++    # ============================================================
++    # 一次定位：resolve_check_runtime 统一解析 runtime + fine_density
++    # ============================================================
++    runtime = resolve_check_runtime(solvent_root, state)
++    snapshot_rel = runtime["snapshot_rel"]
++    # 同步写入无歧义字段
++    if state.get("check_snapshot_rel") != snapshot_rel:
++        state["check_snapshot_rel"] = snapshot_rel
++        save_state(solvent_root, state)
 +
-+    expected_fine_dir = Path(solvent_root) / FINE_SNAPSHOT_DIR
-+
-+    # --- fine_density ---
-+    fine_density_src = None
-+    if state.get("fine_density") is not None:
-+        fine_density_src = "state cache"
++    # fine_density 解析：优先 state → final_result.density → measurements[-1]
 +    final_result = {}
-+    result_path = Path(solvent_root) / FINAL_RESULT_JSON
++    result_path = solvent_root / FINAL_RESULT_JSON
 +    if result_path.is_file():
 +        try:
-+            final_result = json.loads(result_path.read_text(encoding="utf-8"))
++            final_result = json.loads(
++                result_path.read_text(encoding="utf-8")
++            )
 +        except Exception:
 +            final_result = {}
-+
-+    # 强制覆盖 fine_density（优先 final_result.density，不丢 state 值）
++    fd_src = None
++    if state.get("fine_density") is not None:
++        fd_src = "state cache"
 +    if state.get("fine_density") is None and final_result.get("density") is not None:
 +        try:
 +            state["fine_density"] = float(final_result["density"])
-+            fine_density_src = "final_result:density"
-+            re_evaluated = True
++            fd_src = "final_result:density"
 +        except (TypeError, ValueError):
 +            pass
 +    if state.get("fine_density") is None and state.get("measurements"):
-+        last = state["measurements"][-1]
 +        try:
-+            state["fine_density"] = float(last["density"])
-+            fine_density_src = "measurements[-1]:density"
-+            re_evaluated = True
-+        except (TypeError, ValueError, KeyError, IndexError):
++            state["fine_density"] = float(state["measurements"][-1]["density"])
++            fd_src = "measurements[-1]:density"
++        except Exception:
 +            pass
-+
-+    # --- fine_directory ---
-+    fine_directory_src = None
-+    resolved_fine_dir: Optional[Path] = None
-+
-+    # 1) final_density_result.json["snapshot_directory"]
-+    d = final_result.get("snapshot_directory")
-+    if d:
-+        p = Path(d)
-+        if p.is_dir() and (p / "first" / "nvt.cpt").is_file() \
-+                and (p / "first" / "nvt.tpr").is_file():
-+            resolved_fine_dir = p.resolve()
-+            fine_directory_src = "final_result:snapshot_directory"
-+
-+    # 2) solvent_root/fine/ 标准快照目录（如果存在）
-+    if resolved_fine_dir is None and expected_fine_dir.is_dir() \
-+            and (expected_fine_dir / "first" / "nvt.cpt").is_file() \
-+            and (expected_fine_dir / "first" / "nvt.tpr").is_file():
-+        resolved_fine_dir = expected_fine_dir.resolve()
-+        fine_directory_src = f"solvent_root/{FINE_SNAPSHOT_DIR}"
-+
-+    # 3) final_density_result.json["directory"]（原始 trial 目录，兜底）
-+    if resolved_fine_dir is None:
-+        d2 = final_result.get("directory")
-+        if d2:
-+            p2 = Path(d2)
-+            if p2.is_dir() and (p2 / "first" / "nvt.cpt").is_file() \
-+                    and (p2 / "first" / "nvt.tpr").is_file():
-+                resolved_fine_dir = p2.resolve()
-+                fine_directory_src = "final_result:directory"
-+
-+    # 4) state 中已有的 fine_directory 兜底（仅作为最后手段，但要校验）
-+    if resolved_fine_dir is None and state.get("fine_directory"):
-+        p3 = Path(state["fine_directory"])
-+        if p3.is_dir() and (p3 / "first" / "nvt.cpt").is_file() \
-+                and (p3 / "first" / "nvt.tpr").is_file():
-+            resolved_fine_dir = p3.resolve()
-+            fine_directory_src = "state cache"
-+
-+    # 最终覆盖 state["fine_directory"]：只有成功解析到才覆盖
-+    if resolved_fine_dir is not None:
-+        if state.get("fine_directory") != str(resolved_fine_dir):
-+            re_evaluated = True
-+        state["fine_directory"] = str(resolved_fine_dir)
-+
-+    if re_evaluated:
-+        save_state(solvent_root, state)
-+        print(
-+            "\n[fine_dir] 已重新解析 fine_density/fine_directory"
-+            "（不信任 state 缓存，强制覆盖）："
-+        )
-+        print(f"  fine_density    = {state.get('fine_density')}  "
-+              f"(来源: {fine_density_src})")
-+        print(f"  fine_directory  = {state.get('fine_directory')}  "
-+              f"(来源: {fine_directory_src})")
-+        # 关键防御性检查：如果 fine_directory 不是 solvent_root/fine/
-+        # 但 solvent_root/fine/ 本身又存在，提示异常。
-+        if resolved_fine_dir is not None \
-+                and expected_fine_dir.is_dir() \
-+                and resolved_fine_dir != expected_fine_dir.resolve():
-+            warn(
-+                f"注意：解析到的 fine_directory 不是标准路径 "
-+                f"{expected_fine_dir}。\n这通常意味着你的体系是在旧版本"
-+                "脚本下收敛的，fine/ 快照可能不存在或不全。\n"
-+                "续算产物将写入上述解析到的目录中。"
-+            )
-+
 +    if state.get("fine_density") is None:
 +        fail(
-+            "fine_density 缺失，且无法从 final_density_result.json "
-+            "或 measurements 回填。请检查 "
-+            f"{Path(solvent_root) / FINAL_RESULT_JSON} 与 "
-+            f"{Path(solvent_root) / STATE_JSON}。"
++            "fine_density 缺失，且无法从 state / final_density_result.json "
++            "/ measurements 回填。请检查 density_adjustment.json 与 "
++            f"{result_path}。"
 +        )
++    # 同步到 state.fine_directory（仅用于向后兼容展示；实际运行不再依赖它）
++    # 但注意：写入的是真正的 snapshot 绝对路径，不再会是 solvent_root 本身。
++    state["fine_directory"] = str(runtime["snapshot_abs"])
 +
-+    fine_dir = Path(state["fine_directory"]) if state.get("fine_directory") else None
-+    if fine_dir is None or not fine_dir.is_dir():
-+        fail(
-+            "fine 收敛体系目录不存在或无法从以下来源可靠解析：\n"
-+            f"  1) {result_path} 的 snapshot_directory 字段\n"
-+            f"  2) {expected_fine_dir} 目录（first/nvt.cpt 必须存在）\n"
-+            f"  3) {result_path} 的 directory 字段\n"
-+            f"  4) state.fine_directory 缓存\n\n"
-+            "请确认 <solvent_root>/fine/ 目录存在，且 fine/first/nvt.cpt "
-+            "与 fine/first/nvt.tpr 可访问。"
-+        )
-+    # 额外防御：确保 fine 目录的 first/nvt.cpt/tpr 真的存在
-+    if not (fine_dir / "first" / "nvt.cpt").is_file():
-+        fail(
-+            f"fine 目录中找不到原 NVT checkpoint："
-+            f"{fine_dir / 'first' / 'nvt.cpt'}\n"
-+            "没有该文件将无法续算。请检查 fine 快照是否完整复制了 first/ 目录。"
-+        )
-+    if not (fine_dir / "first" / "nvt.tpr").is_file():
-+        fail(
-+            f"fine 目录中找不到原 NVT tpr："
-+            f"{fine_dir / 'first' / 'nvt.tpr'}"
-+        )
++    print(
++        f"\n[runtime] 5ns check 运行根目录：{runtime['runtime_root']}\n"
++        f"          快照相对路径：{runtime['snapshot_rel']}  "
++        f"(来源: {runtime['resolved_from']})\n"
++        f"          first/ 相对路径：{runtime['first_rel']}\n"
++        f"          fine_density：{state['fine_density']}  "
++        f"(来源: {fd_src})"
++    )
++    save_state(solvent_root, state)
 +
 +    # 原始 NVT 总时长（ps），作为第 1 轮 check 的 -b 起算时间
 +    t0 = original_nvt_end_ps(nvt_mdp)
 +    extra_ns = float(state.get("check_extra_ns", CHECK_EXTRA_NS))
 +    extra_ps = extra_ns * 1000.0
 +
-+    # 校验：T0 应不小于原 measure_system 使用的 DENSITY_BEGIN_PS，
-+    # 否则说明原 NVT 比预期短，统计区间与原 fine 不一致。
 +    if t0 < DENSITY_BEGIN_PS:
 +        warn(
 +            f"原 NVT 总时长 {t0:.1f} ps 小于原密度统计起始 "
@@ -752,12 +851,15 @@ index a13777f..c6be6f8 100644
 +    print("\n" + "=" * 72)
 +    print("POST-CONVERGENCE 5NS CHECK")
 +    print("=" * 72)
-+    print(f"Fine directory  : {fine_dir}")
-+    print(f"Fine density     : {state['fine_density']:.6f}")
-+    print(f"Original NVT end : {t0:.1f} ps")
-+    print(f"Extra per round  : {extra_ns:.1f} ns ({extra_ps:.1f} ps)")
-+    print(f"Tolerance        : {state['check_tolerance'] * 100.0:.2f}%")
-+    print(f"Max retries      : {max_retries}")
++    print(f"CWD (fixed)     : {runtime['runtime_root']}")
++    print(f"Snapshot        : {runtime['snapshot_rel']}/")
++    print(f"First/ path     : {runtime['first_rel']}/")
++    print(f"Fine density    : {state['fine_density']:.6f}")
++    print(f"Original NVT end: {t0:.1f} ps")
++    print(f"Extra per round : {extra_ns:.1f} ns ({extra_ps:.1f} ps)")
++    print(f"Tolerance       : {state['check_tolerance'] * 100.0:.2f}%")
++    print(f"Max retries     : {max_retries}")
++    print(f"Output files    : {runtime['first_rel']}/nvt_check_r*.xtc")
 +
 +    # 从 check_round 继续；若 check_round=0 表示尚未开始，从 1 开始
 +    start_round = int(state.get("check_round", 0)) + 1
@@ -767,27 +869,29 @@ index a13777f..c6be6f8 100644
 +        print(f"# CHECK ROUND {round_idx} / {max_retries}")
 +        print("#" * 72)
 +
-+        # 1. 续算 5ns
++        # 1. 续算 5ns（cwd = runtime_root，统一）
 +        paths = extend_nvt_for_check(
-+            system_dir=fine_dir,
++            runtime_root=runtime["runtime_root"],
++            snapshot_rel=runtime["snapshot_rel"],
 +            nvt_mdp=nvt_mdp,
 +            round_idx=round_idx,
 +            extra_ns=extra_ns,
 +        )
 +
 +        # 2. 跑密度：begin = t0 + (round_idx - 1) * extra_ps
-+        #    第 1 轮只统计原 NVT 之后的 5ns 段；
-+        #    第 N 轮只统计第 N 轮新增的 5ns 段（基于上轮 cpt 续算）。
 +        begin_ps = t0 + (round_idx - 1) * extra_ps
-+
 +        xvg = run_check_density(
-+            system_dir=fine_dir,
++            runtime_root=runtime["runtime_root"],
++            snapshot_rel=runtime["snapshot_rel"],
 +            round_idx=round_idx,
 +            begin_ps=begin_ps,
 +        )
 +
-+        # 3. 解析密度（只取 18~22 nm 区间，与 measure_system 一致）
-+        summary, _ = load_summary(fine_dir)
++        # 3. 解析密度（Z=18~22 nm 区间）
++        # runtime.summary_path 指向 <snapshot>/system_summary.json 或
++        # <solvent_root>/system_summary.json，取其 parent 交给
++        # load_summary（读 parent/system_summary.json）。
++        summary, _ = load_summary(runtime["summary_path"].parent)
 +        density_analysis = analyze_density_profile(
 +            xvg_path=xvg,
 +            summary=summary,
@@ -814,13 +918,12 @@ index a13777f..c6be6f8 100644
 +            final=is_final,
 +        )
 +
-+        # 同步更新全局 density_profiles.csv，便于跨体系查看
 +        update_global_density_csv(
 +            collection_root=collection_root,
 +            mof_name=mof_name,
 +            solvent=solvent,
-+            system_dir=fine_dir,
-+            system_name=str(state.get("check_round", 0)),
++            system_dir=runtime["snapshot_abs"],
++            system_name=f"check_r{round_idx}",
 +            density=check_density,
 +            points=density_analysis["bulk_points"],
 +        )
@@ -837,7 +940,6 @@ index a13777f..c6be6f8 100644
 +            print(f"Result file     : {Path(solvent_root) / FINAL_RESULT_JSON}")
 +            return
 +
-+    # 已达最大重试仍未通过
 +    print("\n" + "=" * 72)
 +    print("POST-CONVERGENCE CHECK MAX RETRIES EXCEEDED")
 +    print("=" * 72)
@@ -852,7 +954,7 @@ index a13777f..c6be6f8 100644
  def distinct_measurements_by_emim(state):
      mapping = {}
  
-@@ -2048,8 +2852,20 @@ def main():
+@@ -2048,8 +2954,20 @@ def main():
      print(f"State file         : {state_path(solvent_root)}")
  
      if state.get("status") == "converged":
@@ -874,7 +976,7 @@ index a13777f..c6be6f8 100644
          return
  
      current_trial = Path(
-@@ -2100,6 +2916,16 @@ def main():
+@@ -2100,6 +3018,16 @@ def main():
                  f"Final result file: "
                  f"{Path(solvent_root) / FINAL_RESULT_JSON}"
              )

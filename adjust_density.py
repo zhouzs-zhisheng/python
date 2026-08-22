@@ -261,6 +261,8 @@ CHECK_TPR_PREFIX = "nvt_check_"
 CHECK_XTC_PREFIX = "nvt_check_"
 CHECK_GRO_PREFIX = "nvt_check_"
 CHECK_CPT_PREFIX = "nvt_check_"
+CHECK_EDR_PREFIX = "nvt_check_"
+CHECK_LOG_PREFIX = "nvt_check_"
 CHECK_XVG_PREFIX = "density_check_"
 
 # 真空判据：
@@ -1650,35 +1652,48 @@ def check_round_files(runtime_root, snapshot_rel, round_idx):
     """
     返回第 round_idx 轮 check 的所有产物路径。
 
-    参数：
-        runtime_root : 所有 gmx 命令的 cwd 根，统一为 solvent_root
-                       （如 <MOF>/ACN/ 或 <MOF>/PC/）。
-        snapshot_rel : 相对于 runtime_root 的 fine 快照子目录名，
-                       通常是 "fine"；兼容旧 trial 体系时可能是
-                       数字目录名（如 "440"）。
-                       所有 first/ 下的文件都在：
-                           <runtime_root>/<snapshot_rel>/first/
-                       runtime_root 目录始终是 index.ndx、topol.top
-                       等公共文件的位置。
-
-    每轮独立命名，便于中断后恢复：
-        <snapshot_rel>/first/nvt_check_r1.tpr / .xtc / .gro / .cpt
-        <snapshot_rel>/first/density_check_r1.xvg
+    GROMACS -noappend 续算命名说明：
+        mdrun -noappend -deffnm PREFIX 如果检测到起点 step 不在 0，
+        会在 PREFIX 与文件后缀之间插入 ".part000N." 分段编号；
+        上一次成功运行的 NVT（原 first/nvt）是 part0001，因此
+        check 续算的第一段是 part0002。如果 checkpoint step 本身
+        就是 0 段的延续，则无论哪个版本都一定至少有一个 partNNNN
+        段名落在实际产物上。
+        为了同时兼容"无 part 号"（如果 GROMACS 不写 part）与"带 part 号"
+        两种情况，我们同时记录 "canonical" 与 "any_part" 两套通配，
+        并且在"检测已完成"时接受任一存在；同时为下一轮 -cpi 选对
+        真正的 checkpoint 文件。
     """
     runtime_root = Path(runtime_root)
     snapshot = runtime_root / snapshot_rel
     first_snapshot = snapshot / "first"
     suffix = f"r{round_idx}"
-    return {
-        "tpr":  first_snapshot / f"{CHECK_TPR_PREFIX}{suffix}.tpr",
-        "xtc":  first_snapshot / f"{CHECK_XTC_PREFIX}{suffix}.xtc",
-        "gro":  first_snapshot / f"{CHECK_GRO_PREFIX}{suffix}.gro",
-        "cpt":  first_snapshot / f"{CHECK_CPT_PREFIX}{suffix}.cpt",
+    prefix = first_snapshot / f"{CHECK_TPR_PREFIX}{suffix}"
+
+    canonical = {
+        "tpr":  prefix.with_suffix(".tpr"),
+        "xtc":  prefix.with_suffix(".xtc"),
+        "gro":  prefix.with_suffix(".gro"),
+        "edr":  prefix.with_suffix(".edr"),
+        "log":  prefix.with_suffix(".log"),
+        "cpt":  prefix.with_suffix(".cpt"),
+        "cpt_prev": first_snapshot / f"{CHECK_CPT_PREFIX}{suffix}_prev.cpt",
         "xvg":  first_snapshot / f"{CHECK_XVG_PREFIX}{suffix}.xvg",
+    }
+    return {
+        **canonical,
+        # 段号通配：用于"检查是否已完成 / 定位真实产物"
+        # 这里用 glob 形式（字符串 pattern），不是 Path 对象。
+        "_xtc_glob": str(first_snapshot / f"{CHECK_XTC_PREFIX}{suffix}*.xtc"),
+        "_gro_glob": str(first_snapshot / f"{CHECK_GRO_PREFIX}{suffix}*.gro"),
+        "_edr_glob": str(first_snapshot / f"{CHECK_EDR_PREFIX}{suffix}*.edr"),
+        "_log_glob": str(first_snapshot / f"{CHECK_LOG_PREFIX}{suffix}*.log"),
+        "_cpt_glob": str(first_snapshot / f"{CHECK_CPT_PREFIX}{suffix}*.cpt"),
         # 额外信息：本轮的 snapshot 相对路径
         "_snapshot_rel": str(snapshot_rel),
         "_first_rel": f"{snapshot_rel}/first",
         "_runtime_root": runtime_root,
+        "_prefix_abs": prefix,
     }
 
 
@@ -1826,6 +1841,61 @@ def resolve_check_runtime(solvent_root, state):
     return runtime
 
 
+def _glob_latest(paths_dict, key):
+    """
+    在 paths_dict 的 glob 集合中找到与 key 对应的真实产物文件。
+
+    优先级：
+        1) paths_dict[key]（canonical 文件名，无 part 段号）存在 → 返回它。
+        2) paths_dict[key+"_glob"]（*.xtc、*.gro 等通配）匹配非空 →
+           按 mtime 取最新的返回。
+        3) 对于 key == "cpt" 的额外回退：先找 canonical cpt，找不到
+           再试 cpt_prev（GROMACS 在 checkpoint 写过程中会同时保留
+           deffnm.cpt 与 deffnm_prev.cpt）。
+
+    返回 (abs_path, matched_key_label)；找不到时 (None, None)。
+    """
+    # 1) canonical
+    cand = paths_dict.get(key)
+    if cand is not None and isinstance(cand, Path) and cand.is_file():
+        return cand, f"{key} (canonical)"
+
+    # 2) _glob 通配
+    glob_key = f"_{key}_glob"
+    if glob_key in paths_dict:
+        import glob as _glob
+        matches = [Path(p) for p in _glob.glob(paths_dict[glob_key])]
+        # 排除 canonical（已在 1 命中）以及 part* 中前缀相符的
+        # 注意：*.gro 通配会命中 prefix*.gro（包括 partNNNN）
+        # 过滤：确保匹配前缀与 key 对应的 prefix 一致
+        prefix = paths_dict["_prefix_abs"].name  # e.g. nvt_check_r1
+        ok = []
+        for m in matches:
+            # m.name 形如 nvt_check_r1.gro 或 nvt_check_r1.part0002.gro
+            if m.name.startswith(prefix + ".") or \
+                    ".part" in m.name and m.name.startswith(prefix):
+                ok.append(m)
+        if ok:
+            ok.sort(key=lambda p: p.stat().st_mtime)
+            return ok[-1], f"{key} (*.part glob, newest)"
+
+    # 3) cpt 的 _prev 回退
+    if key == "cpt":
+        prev = paths_dict.get("cpt_prev")
+        if prev is not None and isinstance(prev, Path) and prev.is_file():
+            return prev, "cpt (_prev)"
+
+    return None, None
+
+
+def _check_round_finished(paths_dict):
+    """本轮所有关键产物（xtc + gro + 有效cpt）是否已全部找到。"""
+    xtc, _ = _glob_latest(paths_dict, "xtc")
+    gro, _ = _glob_latest(paths_dict, "gro")
+    cpt, _ = _glob_latest(paths_dict, "cpt")
+    return xtc is not None and gro is not None and cpt is not None
+
+
 def extend_nvt_for_check(
     runtime_root,
     snapshot_rel,
@@ -1834,74 +1904,84 @@ def extend_nvt_for_check(
     extra_ns,
 ):
     """
-    在 fine 快照体系的 NVT 基础上续算 extra_ns ns。
+    在 fine 快照体系的 NVT 基础上续算 extra_ns ns（精确只跑 extra_ns）。
+
+    关键 GROMACS 2020 续跑命名坑与规避：
+        如果你把 extend 过的 tpr（step 起点 0，总步数含原 NVT）与
+        -cpi（实际 step 起点 = 原 NVT 结束步）一起用 -noappend，
+        GROMACS 会认为"多段时间线不能合并"，强制写 .part000N. 段号，
+        产物就是 nvt_check_r1.part0002.gro 而我们找不到 .gro。
+
+        规避策略（不用 -extend 用 -nsteps）：
+            convert-tpr -nsteps TOTAL_STEPS 直接把 tpr 总步数设成
+                原 NVT 步数 + round_idx * extra_steps，
+            这样 checkpoint step 始终落在 [0, TOTAL_STEPS) 区间内，
+            是 tpr 时间线的中间延续，GROMACS 判定为单段连续运行，
+            就不会写 .part000N 段号，产物直接为 .gro/.xtc 干净名。
 
     **关键约束**：所有 gmx 命令的 cwd 都固定为 runtime_root
-    （即 solvent_root，如 ACN/），所有文件路径都用相对路径表达，
-    不再在 trial/fine/first 之间来回切换。
+    （即 solvent_root，如 ACN/）。
 
-    流程：
-        1) gmx convert-tpr 把 <snapshot_rel>/first/nvt.tpr extend extra_ns
-           → <snapshot_rel>/first/nvt_check_rN.tpr
-        2) gmx mdrun -cpi 基于 base_cpt 续算，
-           round 1 基于 <snapshot_rel>/first/nvt.cpt；
-           round N 基于 <snapshot_rel>/first/nvt_check_r(N-1).cpt。
-           使用 -noappend，不污染原 nvt.* 输出。
-
-    可重复性：
-        若本轮 tpr+xtc+gro+cpt 都已存在，直接跳过续算。
+    round N base_cpt 选择：
+        round 1 → first/nvt.cpt（本轮产物结束，写 nvt_check_r1.cpt）
+        round 2 → nvt_check_r1.cpt（或 nvt_check_r1_prev.cpt）
+                  用 _glob_latest("cpt") 动态定位实际存在的那个。
     """
     runtime_root = Path(runtime_root).resolve()
     paths = check_round_files(runtime_root, snapshot_rel, round_idx)
 
-    # 已完整生成则跳过
-    if (
-        paths["tpr"].is_file()
-        and paths["xtc"].is_file()
-        and paths["gro"].is_file()
-        and paths["cpt"].is_file()
-    ):
-        print(
-            f"第 {round_idx} 轮 NVT 续算已完成，跳过："
-            f"{paths['xtc']}"
-        )
+    # 已完整生成则跳过（同时兼容 canonical 与 part 段号命名）
+    if _check_round_finished(paths):
+        xtc, label = _glob_latest(paths, "xtc")
+        print(f"第 {round_idx} 轮 NVT 续算已完成，跳过：{xtc} ({label})")
         return paths
 
-    # 解析 dt
-    _, dt = parse_mdp_nsteps_dt(nvt_mdp)
+    # 解析 nsteps / dt
+    nsteps0, dt = parse_mdp_nsteps_dt(nvt_mdp)
+    extra_steps = int(round(float(extra_ns) * 1000.0 / dt))
+    total_steps_for_round = int(nsteps0) + int(round_idx) * extra_steps
     extend_ps = float(extra_ns) * 1000.0
 
-    # 自动选择 base cpt（相对 runtime_root）
     first_rel = paths["_first_rel"]
-    if round_idx == 1:
-        base_cpt_rel = f"{first_rel}/nvt.cpt"
-    else:
-        prev_paths = check_round_files(runtime_root, snapshot_rel, round_idx - 1)
-        base_cpt_rel = str(
-            prev_paths["cpt"].relative_to(runtime_root)
-        )
-    base_cpt_abs = runtime_root / base_cpt_rel
-    if not base_cpt_abs.is_file():
-        fail(
-            f"找不到续算起点 cpt：{base_cpt_abs}\n"
-            "请确认原 NVT 已完成（fine/first/nvt.cpt 存在）。"
-        )
-
     base_tpr_rel = f"{first_rel}/nvt.tpr"
     tpr_rel = str(paths["tpr"].relative_to(runtime_root))
     deffnm_rel = f"{first_rel}/{CHECK_TPR_PREFIX}r{round_idx}"
 
-    # gmx convert-tpr -extend 单位是 ps。
+    # --- 自动选择 base cpt（相对 runtime_root） ---
+    if round_idx == 1:
+        base_cpt_rel = f"{first_rel}/nvt.cpt"
+        base_cpt_abs = runtime_root / base_cpt_rel
+        if not base_cpt_abs.is_file():
+            fail(
+                f"找不到续算起点 cpt：{base_cpt_abs}\n"
+                "请确认原 NVT 已完成（fine/first/nvt.cpt 存在）。"
+            )
+    else:
+        prev_paths = check_round_files(runtime_root, snapshot_rel, round_idx - 1)
+        prev_cpt, label = _glob_latest(prev_paths, "cpt")
+        if prev_cpt is None:
+            fail(
+                f"第 {round_idx-1} 轮 checkpoint 缺失，无法作为第 {round_idx} 轮的续算起点。\n"
+                f"检查位置：{prev_paths['cpt']} 与 {prev_paths['_cpt_glob'] if '_cpt_glob' in prev_paths else '(no glob)'}"
+            )
+        try:
+            base_cpt_rel = str(prev_cpt.relative_to(runtime_root))
+        except ValueError:
+            base_cpt_rel = str(prev_cpt)
+        base_cpt_abs = prev_cpt
+        print(f"第 {round_idx} 轮 base cpt: {base_cpt_rel} ({label})")
+
+    # --- gmx convert-tpr -nsteps（不用 -extend，避免 .partNNNN. 段号） ---
     if not paths["tpr"].is_file():
         print(
-            f"\n[convert-tpr] 续算 {extend_ps:.1f} ps "
-            f"({extra_ns:.1f} ns / dt={dt}) -> {paths['tpr']}"
+            f"\n[convert-tpr] 本轮 tpr 总步数设为 {total_steps_for_round} "
+            f"(原 NVT {nsteps0} + {round_idx}*{extra_steps}) -> {paths['tpr']}"
         )
         run_command(
             [
                 "gmx", "convert-tpr",
                 "-s", base_tpr_rel,
-                "-extend", f"{extend_ps:.1f}",
+                "-nsteps", str(total_steps_for_round),
                 "-o", tpr_rel,
             ],
             cwd=runtime_root,
@@ -1909,11 +1989,7 @@ def extend_nvt_for_check(
     else:
         print(f"第 {round_idx} 轮 tpr 已存在，跳过 convert-tpr：{paths['tpr']}")
 
-    # gmx mdrun：
-    #   * cwd = runtime_root（固定 solvent_root）
-    #   * -s / -deffnm 都相对 runtime_root 表达
-    #   * -cpi 同样相对 runtime_root（保证找到 checkpoint）
-    #   * -noappend：沿用 checkpoint step 但写新的 nvt_check_rN.* 文件
+    # --- gmx mdrun -cpi -noappend（产物应为 clean 名，无 .partNNNN. 段号） ---
     cmd = [
         "gmx", "mdrun",
         "-s", tpr_rel,
@@ -1926,18 +2002,32 @@ def extend_nvt_for_check(
     ]
 
     print(
-        f"[mdrun] 续算 {extend_ps:.1f} ps，"
+        f"[mdrun] 续算 {extend_ps:.1f} ps = {extra_steps} steps/dt={dt}，"
         f"基于 cpt {base_cpt_rel} "
         f"(cwd={runtime_root}) "
-        f"-> {paths['gro']}"
+        f"deffnm={deffnm_rel}"
     )
     run_command(cmd, cwd=runtime_root)
 
-    for key in ("gro", "xtc", "cpt"):
-        if not paths[key].is_file():
-            fail(
-                f"第 {round_idx} 轮 NVT 续算结束后未生成：{paths[key]}"
-            )
+    # --- 检查最终产物 ---
+    if not _check_round_finished(paths):
+        # 详细展示到底缺什么
+        xtc, lbl_x = _glob_latest(paths, "xtc")
+        gro, lbl_g = _glob_latest(paths, "gro")
+        cpt, lbl_c = _glob_latest(paths, "cpt")
+        info = []
+        for k, found, lbl in (
+            ("xtc", xtc, lbl_x),
+            ("gro", gro, lbl_g),
+            ("cpt", cpt, lbl_c),
+        ):
+            info.append(f"  {k}: {'OK ' + str(found) + ' (' + lbl + ')' if found else 'MISSING'}")
+        fail(
+            f"第 {round_idx} 轮 NVT 续算结束后缺少关键产物。\n"
+            + "\n".join(info)
+            + "\n如果 .gro/.xtc 有 .part000N. 段号，说明 tpr 起始 step 与 checkpoint "
+            + "step 仍有不匹配；请查看 mdrun 日志（deffnm.log）确认。"
+        )
 
     return paths
 
@@ -1959,7 +2049,8 @@ def run_check_density(runtime_root, snapshot_rel, round_idx, begin_ps):
     runtime_root = Path(runtime_root).resolve()
     paths = check_round_files(runtime_root, snapshot_rel, round_idx)
 
-    xtc = paths["xtc"]
+    # xtc 用 _glob_latest 找（可能是 canonical 或 .part000N. 段号）
+    xtc, xtc_label = _glob_latest(paths, "xtc")
     tpr = paths["tpr"]
     xvg = paths["xvg"]
     # index.ndx 默认就放在 runtime_root 下（即 solvent_root）
@@ -1969,9 +2060,15 @@ def run_check_density(runtime_root, snapshot_rel, round_idx, begin_ps):
         print(f"第 {round_idx} 轮 check 密度已存在，复用：{xvg}")
         return xvg
 
-    for p in (xtc, tpr, index):
+    if xtc is None:
+        fail(
+            f"找不到第 {round_idx} 轮的 xtc 轨迹。\n"
+            f"检查过：{paths['xtc']} 与 glob {paths['_xtc_glob']}"
+        )
+    for p, name in [(tpr, "tpr"), (index, "index.ndx")]:
         if not p.is_file():
-            fail(f"check density 输入文件不存在：{p}")
+            fail(f"check density 输入文件不存在：{name} -> {p}")
+    print(f"第 {round_idx} 轮 check 用 xtc={xtc} ({xtc_label})")
 
     xtc_rel = str(xtc.relative_to(runtime_root))
     tpr_rel = str(tpr.relative_to(runtime_root))
