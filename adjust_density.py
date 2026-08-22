@@ -284,6 +284,22 @@ NTMPI = 32
 NTOMP = 1
 MAX_ITERATIONS = 30
 
+# ============================================================
+# 模拟失败 → 二分回退机制
+#
+# 当 ensure_simulation (index/min/NVT) 在某轮 loop 失败时，
+# 主循环 catch SimulationFailure，进入 handle_simulation_failure：
+#   - step > SIMULATION_MAX_STEP  → 判定为分子增量过多
+#     用二分法：new_step = max(step // 2, SIMULATION_MIN_SAFE_STEP)
+#     new_target = parent_emim + new_step，重新生成体系并重跑
+#   - step <= SIMULATION_MAX_STEP → 视为非分子过多问题，直接 fail 退出
+#
+# state["failed_trials"] 记录所有失败的 (emim, parent_emim, step, reason, backup_dir)，
+# choose_next_trial 在外推时会避开这些 N，避免"外推 → 同一 N 失败"死循环。
+# ============================================================
+SIMULATION_MAX_STEP = 15      # 单次增量上限：超过此值失败时认定为分子过多
+SIMULATION_MIN_SAFE_STEP = 1  # 二分砍到此值仍失败 → 真实失败，直接退出
+
 SUMMARY_NAME = "system_summary.json"
 STATE_JSON = "density_adjustment.json"
 STATE_CSV = "density_adjustment.csv"
@@ -300,6 +316,14 @@ FINE_SNAPSHOT_DIR = "fine"
 MOLECULES = ("EMIM", "BF4", "ACN", "PC")
 
 
+class SimulationFailure(Exception):
+    """mdrun / minimization 等模拟命令失败，可被主循环捕获后回退重试。
+
+    与 fail() 的区别：fail() 是不可恢复的硬退出，
+    SimulationFailure 表示"本次体系模拟没跑通，但可能通过缩小增量重试"。
+    """
+
+
 def fail(message, code=1):
     print(f"\n错误：{message}")
     sys.exit(code)
@@ -313,7 +337,7 @@ def now_string():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def run_command(args, cwd, stdin_text=None):
+def run_command(args, cwd, stdin_text=None, soft=False):
     print("\n[运行目录]")
     print(cwd)
     print("[命令]")
@@ -328,12 +352,17 @@ def run_command(args, cwd, stdin_text=None):
             check=True,
         )
     except FileNotFoundError:
+        # 找不到命令属于环境问题，无论 soft 与否都直接 fail
         fail(f"找不到命令：{args[0]}")
     except subprocess.CalledProcessError as exc:
-        fail(
+        msg = (
             f"命令执行失败，返回码 {exc.returncode}：\n"
             + " ".join(str(x) for x in args)
         )
+        if soft:
+            # 抛 SimulationFailure 让主循环决定是否回退
+            raise SimulationFailure(msg)
+        fail(msg)
 
 
 def check_command(name):
@@ -493,6 +522,12 @@ def new_state(solvent, mof_name, target_density, initial_system_dir):
         "check_max_retries": CHECK_MAX_RETRIES,
         "check_extra_ns": CHECK_EXTRA_NS,
         "check_measurements": [],    # 每轮 check 的密度记录
+        # === 模拟失败 → 二分回退机制 ===
+        # 每次模拟失败后追加一条：
+        #   {"emim": int, "parent_emim": int, "step": int,
+        #    "reason": str, "backup_dir": str, "ts": int}
+        # choose_next_trial 在外推时避开这些 N。
+        "failed_trials": [],
     }
 
 
@@ -513,6 +548,8 @@ def ensure_check_fields(state):
         "check_max_retries": CHECK_MAX_RETRIES,
         "check_extra_ns": CHECK_EXTRA_NS,
         "check_measurements": [],
+        # 二分回退机制：旧 state 没有此字段时补齐
+        "failed_trials": [],
     }
     changed = False
     for k, v in defaults.items():
@@ -764,10 +801,12 @@ def ensure_minimization(system_dir, min_mdp):
             "-v",
         ],
         cwd=system_dir,
+        soft=True,
     )
 
     if not min_gro.is_file():
-        fail(f"minimization 结束后找不到：{min_gro}")
+        # mdrun 返回了 0 但产物缺失，也按模拟失败处理（更可能是异常中断）
+        raise SimulationFailure(f"minimization 结束后找不到：{min_gro}")
 
     return min_gro
 
@@ -833,13 +872,13 @@ def ensure_nvt(system_dir, nvt_mdp):
             "本次将从 nvt.tpr 重新运行 NVT，并由 GROMACS 处理已有输出文件。"
         )
 
-    run_command(cmd, cwd=system_dir)
+    run_command(cmd, cwd=system_dir, soft=True)
 
     if not nvt_gro.is_file():
-        fail(f"NVT 结束后找不到：{nvt_gro}")
+        raise SimulationFailure(f"NVT 结束后找不到：{nvt_gro}")
 
     if not nvt_xtc.is_file():
-        fail(f"NVT 结束后找不到：{nvt_xtc}")
+        raise SimulationFailure(f"NVT 结束后找不到：{nvt_xtc}")
 
     return nvt_gro
 
@@ -848,6 +887,133 @@ def ensure_simulation(system_dir, min_mdp, nvt_mdp):
     ensure_index(system_dir)
     ensure_minimization(system_dir, min_mdp)
     ensure_nvt(system_dir, nvt_mdp)
+
+
+def handle_simulation_failure(
+    solvent_root,
+    state,
+    failed_dir,
+    parent_measurement,
+    target_emim,
+    step,
+    exc,
+):
+    """模拟失败处理：备份失败目录 + 记录 failed_trials + 二分回退。
+
+    参数
+    ----
+    solvent_root       : str / Path
+        体系根目录（density_adjustment.json 所在目录）
+    state              : dict
+        当前 state，函数内部会写入 failed_trials 并 save_state
+    failed_dir         : str / Path
+        模拟失败的目录（如 .../PC/467）
+    parent_measurement: dict or None
+        当前 trial 的父体系 measurement（含 directory / composition）。
+        step > SIMULATION_MAX_STEP 时一定不为 None。
+    target_emim        : int
+        失败 trial 的 EMIM 数量
+    step               : int
+        本轮增量 = target_emim - parent_emim
+    exc                : Exception
+        捕获到的 SimulationFailure
+
+    返回
+    ----
+    new_target_emim : int
+        二分回退后的新目标 EMIM，让主循环用 parent_measurement 重新生成
+
+    异常
+    ----
+    若 step <= SIMULATION_MAX_STEP：视为非分子过多问题，直接 fail。
+    若二分砍到 MIN_SAFE_STEP 仍失败：fail。
+    """
+    failed_dir = Path(failed_dir)
+    failed_emim = int(target_emim)
+    parent_emim = (
+        int(parent_measurement["composition"]["EMIM"])
+        if parent_measurement is not None
+        else failed_emim
+    )
+
+    # === 1. 备份失败目录 ===
+    if failed_dir.exists():
+        backup_dir = failed_dir.with_name(
+            failed_dir.name
+            + f".failed_backup_{int(time.time())}"
+        )
+        counter = 1
+        while backup_dir.exists():
+            backup_dir = failed_dir.with_name(
+                failed_dir.name
+                + f".failed_backup_{int(time.time())}_{counter}"
+            )
+            counter += 1
+
+        print("\n" + "=" * 72)
+        print("SIMULATION FAILED")
+        print("=" * 72)
+        print(f"Failed dir    : {failed_dir}")
+        print(f"Parent EMIM   : {parent_emim}")
+        print(f"Target EMIM   : {failed_emim}")
+        print(f"Step          : {step}")
+        print(f"Reason        : {exc}")
+        print(f"Backup to     : {backup_dir}")
+        failed_dir.rename(backup_dir)
+    else:
+        backup_dir = None
+
+    # === 2. 记录 failed_trials ===
+    entry = {
+        "emim": failed_emim,
+        "parent_emim": parent_emim,
+        "step": int(step),
+        "reason": str(exc),
+        "backup_dir": str(backup_dir) if backup_dir is not None else None,
+        "ts": int(time.time()),
+    }
+    state.setdefault("failed_trials", []).append(entry)
+    save_state(solvent_root, state)
+
+    # === 3. 判定是否分子过多 ===
+    if step <= SIMULATION_MAX_STEP:
+        # step 已很小仍失败 → 不是分子过多问题，真实退出
+        fail(
+            f"step={step} ≤ SIMULATION_MAX_STEP={SIMULATION_MAX_STEP}，"
+            "认为不是分子增量过多导致的失败。\n"
+            f"原始失败原因：{exc}\n"
+            "请人工检查 mdp / 拓扑 / 体系电荷 等配置。"
+        )
+
+    # === 4. 二分回退 ===
+    failed_emims = {ft["emim"] for ft in state["failed_trials"]}
+    new_step = max(step // 2, SIMULATION_MIN_SAFE_STEP)
+    new_target = parent_emim + new_step
+
+    # 如果新 target 也失败过，继续往下二分
+    while new_target in failed_emims and new_step > SIMULATION_MIN_SAFE_STEP:
+        new_step = max(new_step // 2, SIMULATION_MIN_SAFE_STEP)
+        new_target = parent_emim + new_step
+
+    if new_target in failed_emims:
+        # 砍到 MIN_SAFE_STEP 仍命中 failed_emims，说明从 parent_emim 起所有
+        # 可能的 step 都已被探索并失败，无法继续
+        fail(
+            f"二分已砍到 step={SIMULATION_MIN_SAFE_STEP}，"
+            f"但新 target EMIM={new_target} 仍在 failed_trials 中，"
+            "无法继续回退。请人工检查体系。"
+        )
+
+    print(
+        f"step={step} > SIMULATION_MAX_STEP={SIMULATION_MAX_STEP}，"
+        "判定为分子增量过多。"
+    )
+    print(
+        f"二分回退：new_step={new_step}, new_target_emim={new_target} "
+        f"(parent={parent_emim})"
+    )
+
+    return new_target
 
 
 def run_density(system_dir):
@@ -2646,6 +2812,41 @@ def bracket_measurements(state):
     return lower, upper
 
 
+def avoid_failed_emim(state, current_n, candidate):
+    """过滤已失败的 N：如果 candidate 已在 failed_trials 中，
+    在 (current_n, candidate] 区间二分找一个未失败过的 N。
+
+    若整个区间都已失败过 → fail() 退出，无法继续回退。
+
+    参数
+    ----
+    state     : 全局 state
+    current_n : 父体系的 EMIM 数量（区间的下界，不含）
+    candidate : 预测出的目标 EMIM（区间的上界，含）
+
+    返回
+    ----
+    new_candidate : int
+        若 candidate 未失败过，原样返回；
+        否则返回区间内未失败过的最大整数 N（向小二分）。
+    """
+    failed_emims = {ft["emim"] for ft in state.get("failed_trials", [])}
+
+    if not failed_emims or candidate not in failed_emims:
+        return candidate
+
+    # 在 (current_n, candidate] 区间从大到小找未失败的 N
+    for n in range(candidate, current_n, -1):
+        if n not in failed_emims:
+            return n
+
+    fail(
+        f"预测的 N={candidate} 已在 failed_trials 中，"
+        f"且区间 ({current_n}, {candidate}] 内所有整数 N 均已失败过，"
+        "无法继续回退。请人工检查体系。"
+    )
+
+
 def linear_prediction(n1, rho1, n2, rho2, target):
     denom = rho2 - rho1
 
@@ -2958,7 +3159,17 @@ def choose_next_trial(state, current_measurement):
     # 真空检测优先级高于平均密度插值。
     # 只要当前体系存在局部真空，就先补分子，不使用当前点做普通 bracket 决策。
     if current_measurement.get("vacuum_detected", False):
-        return choose_vacuum_fill_trial(current_measurement)
+        parent, target, region_allocs, vac_reason = choose_vacuum_fill_trial(
+            current_measurement
+        )
+        # 避开已失败的 N（vacuum 分支单次增量一般较小，命中较少）
+        cur_n = int(parent["composition"]["EMIM"])
+        new_target = avoid_failed_emim(state, cur_n, target)
+        if new_target != target:
+            # target 被避开后，原 region_allocations 失效，回退到默认分配
+            region_allocs = None
+            vac_reason += " + avoid failed_trials"
+        return parent, new_target, region_allocs, vac_reason
 
     lower, upper = bracket_measurements(state)
 
@@ -2991,6 +3202,9 @@ def choose_next_trial(state, current_measurement):
 
         candidate = max(n_low + 1, candidate)
         candidate = min(n_high - 1, candidate)
+
+        # 避开已失败的 N（区间内二分一个未失败的 N）
+        candidate = avoid_failed_emim(state, n_low, candidate)
 
         return lower, candidate, None, reason
 
@@ -3056,6 +3270,9 @@ def choose_next_trial(state, current_measurement):
     if candidate - current_n > max_step:
         candidate = current_n + max_step
         reason += " + step cap"
+
+    # 避开已失败的 N（区间内二分一个未失败的 N）
+    candidate = avoid_failed_emim(state, current_n, candidate)
 
     return current_measurement, candidate, None, reason
 
@@ -3492,12 +3709,57 @@ def main():
         print("#" * 72)
         print(f"Current trial : {current_trial}")
 
-        # 1. 当前体系完成 index/min/NVT
-        ensure_simulation(
-            system_dir=current_trial,
-            min_mdp=min_mdp,
-            nvt_mdp=nvt_mdp,
-        )
+        # 重建当前 trial 的 (parent_measurement, target_emim, step)：
+        # - target_emim_current 直接从 current_trial 目录名解析
+        # - parent_measurement 用 bracket_measurements 的 lower（最大的
+        #   小于 target 的已测点），即为生成 current_trial 时所用父体系
+        target_emim_current = int(current_trial.name)
+        _lower, _upper = bracket_measurements(state)
+        if _lower is not None:
+            parent_measurement_current = _lower
+            step_current = (
+                target_emim_current
+                - int(_lower["composition"]["EMIM"])
+            )
+        else:
+            # 首次循环：current_trial 是初始体系，没有 parent
+            parent_measurement_current = None
+            step_current = 0
+
+        # 1. 当前体系完成 index/min/NVT（失败可触发二分回退）
+        try:
+            ensure_simulation(
+                system_dir=current_trial,
+                min_mdp=min_mdp,
+                nvt_mdp=nvt_mdp,
+            )
+        except SimulationFailure as exc:
+            # 分子过多失败 → 备份失败目录 + 写 failed_trials + 二分回退
+            new_target = handle_simulation_failure(
+                solvent_root=solvent_root,
+                state=state,
+                failed_dir=current_trial,
+                parent_measurement=parent_measurement_current,
+                target_emim=target_emim_current,
+                step=step_current,
+                exc=exc,
+            )
+            # 用二分后的新 target 从原父体系重新生成
+            new_dir = ensure_target_system(
+                solvent_root=solvent_root,
+                solvent=solvent,
+                parent_measurement=parent_measurement_current,
+                target_emim=new_target,
+                incremental_script=incremental_script,
+                collection_root=collection_root,
+                # 二分回退不参与真空分区域填充
+                region_allocations=None,
+            )
+            state["current_trial_dir"] = str(new_dir)
+            save_state(solvent_root, state)
+            current_trial = new_dir
+            # 进入下一轮 loop，重新 ensure_simulation
+            continue
 
         # 2. 测量密度
         measurement = measure_system(
