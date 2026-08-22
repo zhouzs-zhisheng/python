@@ -385,6 +385,78 @@ def allocate_additions(added, summary):
     }
 
 
+def load_region_allocations(path, added):
+    """
+    读取由 adjust_density.py 通过 --region-allocations 透传的显式
+    分区域填充数量。文件格式：
+
+        {
+            "EMIM": [k0, k1, k2],
+            "BF4":  [k0, k1, k2],
+            "ACN":  [k0, k1, k2],
+            "PC":   [0, 0, 0]
+        }
+
+    校验：
+        1. 每个 MOLECULE_ORDER 中的 mol 都存在；
+        2. 每个 mol 的分配是长度 3 的非负整数列表；
+        3. 每个 mol 的三段之和必须严格等于 added[mol]
+           （与 compute_additions 计算的本轮新增量一致）。
+
+    返回归一化后的 dict：所有 4 种分子的分配都被填充为长度 3 列表
+    （即使该 mol 的 added 为 0，也返回 [0,0,0]）。
+    """
+    if path is None:
+        return None
+
+    path = Path(path).resolve()
+    if not path.is_file():
+        fail(f"--region-allocations 指定的文件不存在：{path}")
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        fail(f"--region-allocations JSON 解析失败：{exc}")
+
+    if not isinstance(data, dict):
+        fail("--region-allocations 必须是 JSON 对象。")
+
+    normalized = {}
+    for mol in MOLECULE_ORDER:
+        if mol not in data:
+            # 缺失的 mol 按 0 处理（例如 PC 在 ACN 溶剂下不应有分配）。
+            normalized[mol] = [0, 0, 0]
+            continue
+
+        arr = data[mol]
+        if (
+            not isinstance(arr, list)
+            or len(arr) != 3
+            or not all(
+                isinstance(x, int) and not isinstance(x, bool) and x >= 0
+                for x in arr
+            )
+        ):
+            fail(
+                f"--region-allocations 中 {mol} 必须是长度 3 的非负整数列表，"
+                f"当前值：{arr!r}"
+            )
+        normalized[mol] = list(arr)
+
+    # 校验每个 mol 的总和等于 added[mol]。
+    for mol in MOLECULE_ORDER:
+        s = sum(normalized[mol])
+        if s != added[mol]:
+            fail(
+                f"--region-allocations 中 {mol} 的三段之和 {s} "
+                f"不等于本轮需要新增的 {added[mol]}。"
+                f"\n请重新生成 region_allocations 文件，"
+                f"或省略 --region-allocations 以使用默认厚度加权分配。"
+            )
+
+    return normalized
+
+
 def determine_series_root(parent_dir):
     """数字父目录的下一代输出为其兄弟目录；否则输出到当前父目录下。"""
     parent_dir = Path(parent_dir).resolve()
@@ -1088,6 +1160,17 @@ def parse_args():
         help="目标最终分子总数量 JSON，例如 new_mix_ratio.json。"
     )
     parser.add_argument(
+        "--region-allocations",
+        default=None,
+        help=(
+            "可选。显式指定每个分子在三个 Packmol 插入子区域的填充数量，"
+            "形如 {\"EMIM\":[k0,k1,k2],\"BF4\":[...],\"ACN\":[...],\"PC\":[0,0,0]}。"
+            "用于真空优先填充场景：当真空仅出现在某些插入子区域时，"
+            "把分子只填到真空子区域（例如 [30,0,0]）。"
+            "省略时按三个插入区的厚度比例默认分配。"
+        ),
+    )
+    parser.add_argument(
         "--summary",
         default=None,
         help="母体系 summary；默认同目录 system_summary.json，否则尝试唯一 *_summary.json。"
@@ -1167,9 +1250,25 @@ def main():
         )
 
     packmol_info = parse_packmol_input(inp_path)
-    assignment = allocate_additions(added, parent_summary)
 
-    print("\n[ 本轮新增分子的三区分配 ]")
+    # 优先使用 --region-allocations 显式分配（用于真空优先填充场景）；
+    # 否则按三个插入区的厚度比例默认分配。
+    region_assignment = load_region_allocations(
+        args.region_allocations, added
+    )
+
+    if region_assignment is not None:
+        assignment = region_assignment
+        print(
+            "\n[ 本轮新增分子的三区分配 (来自 --region-allocations: "
+            f"{args.region_allocations}) ]"
+        )
+    else:
+        assignment = allocate_additions(added, parent_summary)
+        print(
+            "\n[ 本轮新增分子的三区分配 (默认厚度加权) ]"
+        )
+
     for mol in MOLECULE_ORDER:
         if added[mol] > 0:
             a = assignment[mol]

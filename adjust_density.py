@@ -603,6 +603,9 @@ def write_state_csv(solvent_root, state):
         "ElectrolyteVacuumFraction",
         "ElectrodeVacuumFraction",
         "EffectiveVacuumFraction",
+        "VacuumInInsertion",
+        "VacuumInElectrodeOnly",
+        "InsertionRegionVacuumFraction",
         "VacuumThreshold",
         "VacuumSegments",
         "MeasuredAt",
@@ -634,6 +637,18 @@ def write_state_csv(solvent_root, state):
             ),
             "EffectiveVacuumFraction": m.get(
                 "effective_vacuum_fraction", 0.0
+            ),
+            "VacuumInInsertion": m.get(
+                "vacuum_in_insertion", False
+            ),
+            "VacuumInElectrodeOnly": m.get(
+                "vacuum_in_electrode_only", False
+            ),
+            "InsertionRegionVacuumFraction": ";".join(
+                f"{x:.6f}"
+                for x in m.get(
+                    "insertion_region_vacuum_fraction", []
+                )
             ),
             "VacuumThreshold": m.get("vacuum_threshold", ""),
             "VacuumSegments": len(m.get("vacuum_segments", [])),
@@ -954,6 +969,44 @@ def point_region_type(z, electrode_regions):
     return "electrolyte"
 
 
+def get_insertion_regions(summary):
+    """
+    从 system_summary.json 的 packmol_insertion_regions_nm 中提取三个
+    可插入分子的非电极（真空）区域：lower / middle / upper。
+
+    返回 [(z_low_0, z_high_0), (z_low_1, z_high_1), (z_low_2, z_high_2)]。
+    若 summary 缺少该字段，返回空列表（调用方据此降级为旧逻辑）。
+    """
+    regions = summary.get("packmol_insertion_regions_nm")
+    if not isinstance(regions, list) or len(regions) != 3:
+        return []
+
+    out = []
+    for idx, region in enumerate(regions, start=1):
+        if not isinstance(region, dict):
+            return []
+        try:
+            z_low = float(region["z_low"])
+            z_high = float(region["z_high"])
+        except (KeyError, TypeError, ValueError):
+            return []
+        if z_high < z_low:
+            return []
+        out.append((z_low, z_high))
+    return out
+
+
+def point_insertion_index(z, insertion_regions):
+    """
+    给定 Z 坐标，返回它落在三个 insertion 区域中的哪一个（0/1/2）。
+    若不属于任何 insertion 区域（即落在电极区），返回 -1。
+    """
+    for idx, (z_low, z_high) in enumerate(insertion_regions):
+        if z_low <= z <= z_high:
+            return idx
+    return -1
+
+
 def analyze_density_profile(xvg_path, summary, target_density):
     """
     同时完成：
@@ -972,6 +1025,19 @@ def analyze_density_profile(xvg_path, summary, target_density):
 
        注意这里不是用一个 segment 的中心点简单分类，而是逐点分类。
        因此如果真空段跨过电极/电解液边界，其两部分会分别统计。
+
+    4. 非电极（插入）区按子区域统计真空
+       利用 summary["packmol_insertion_regions_nm"]（共3个区域：
+       lower / middle / upper insertion region），逐点判断每个真空切片
+       落在哪个插入子区域。
+
+       输出：
+           insertion_region_vacuum_fraction : 长度3列表
+               = 每个插入子区域内的真空切片 / 全部有效 Z 切片
+           vacuum_in_insertion : bool
+               任一插入子区域存在真空（即非电极区有真空）
+           vacuum_in_electrode_only : bool
+           真空存在但全部位于电极区（即非电极区无真空）
 
     返回的真空比例：
         vacuum_fraction
@@ -1037,6 +1103,13 @@ def analyze_density_profile(xvg_path, summary, target_density):
     # --------------------------------------------------------
     electrode_regions = get_electrode_regions(summary)
 
+    # 同时获取三个非电极（可插入）子区域，用于按子区域统计真空。
+    # 若 summary 缺少 packmol_insertion_regions_nm，则降级为 None，
+    # analyze_density_profile 仍能给出旧的整盒/电极/电解液分类，
+    # 但不会输出按子区域的真空分布（choose_vacuum_fill_trial 据此
+    # 退回到默认厚度加权分配）。
+    insertion_regions = get_insertion_regions(summary)
+
     # --------------------------------------------------------
     # 3. 整盒连续低密度检测
     # --------------------------------------------------------
@@ -1048,6 +1121,12 @@ def analyze_density_profile(xvg_path, summary, target_density):
     vacuum_points = 0
     electrode_vacuum_points = 0
     electrolyte_vacuum_points = 0
+
+    # 三个非电极（插入）子区域：lower / middle / upper
+    # 真空点数和总点数，用于按子区域计算真空比例。
+    n_ins = len(insertion_regions)  # 期望为 3
+    insertion_total_points = [0] * n_ins
+    insertion_vacuum_points = [0] * n_ins
 
     vacuum_segments = []
     current_run = []
@@ -1061,6 +1140,9 @@ def analyze_density_profile(xvg_path, summary, target_density):
         if len(current_run) >= VACUUM_MIN_CONSECUTIVE_POINTS:
             segment_electrode_points = 0
             segment_electrolyte_points = 0
+            # 子区域真空点数（仅在该 segment 内累加，本函数结束时
+            # 再合并到全局 insertion_vacuum_points）。
+            seg_ins_points = [0] * n_ins
 
             classified_points = []
 
@@ -1077,11 +1159,25 @@ def analyze_density_profile(xvg_path, summary, target_density):
                 else:
                     segment_electrolyte_points += 1
 
+                # 同时累计每个真空切片所属的 insertion 子区域。
+                # 注意：electrolyte 区域与 insertion 区域一一对应
+                # （insertion 是 electrolyte 的可插入子集），但 insertion
+                # 区域可能略小（扣除两侧 MARGIN_Z_NM），因此用
+                # point_insertion_index 单独判定，未落入任何 insertion
+                # 区域的电解液真空点不参与子区域分配。
+                if n_ins > 0:
+                    ins_idx = point_insertion_index(z, insertion_regions)
+                    if ins_idx >= 0:
+                        seg_ins_points[ins_idx] += 1
+
             segment_total = len(current_run)
 
             vacuum_points += segment_total
             electrode_vacuum_points += segment_electrode_points
             electrolyte_vacuum_points += segment_electrolyte_points
+
+            for i in range(n_ins):
+                insertion_vacuum_points[i] += seg_ins_points[i]
 
             # 给 segment 一个主要位置标签，便于日志阅读。
             if (
@@ -1117,7 +1213,14 @@ def analyze_density_profile(xvg_path, summary, target_density):
 
     # Python nonlocal 不能使用括号列表，因此上面的定义需要普通语法。
 
+    # 在主扫描循环里，同时累计每个 Z 切片落入哪个 insertion 子区域，
+    # 用于按子区域计算真空比例（分母是该子区域内全部切片数）。
     for z, rho in profile:
+        if n_ins > 0:
+            ins_idx = point_insertion_index(z, insertion_regions)
+            if ins_idx >= 0:
+                insertion_total_points[ins_idx] += 1
+
         if rho < vacuum_threshold:
             current_run.append((z, rho))
         else:
@@ -1151,6 +1254,30 @@ def analyze_density_profile(xvg_path, summary, target_density):
 
     vacuum_detected = len(vacuum_segments) > 0
 
+    # --- 非电极（插入）子区域真空比例 ---
+    # 每个子区域内的真空切片 / 全部有效 Z 切片（与 electrolyte_vacuum_fraction
+    # 同口径），以便 choose_vacuum_fill_trial 直接复用同一 k 公式。
+    insertion_region_vacuum_fraction = [
+        (
+            insertion_vacuum_points[i] / total_points
+            if total_points > 0
+            else 0.0
+        )
+        for i in range(n_ins)
+    ]
+
+    # 任一 insertion 子区域存在真空 => 非电极区有真空。
+    vacuum_in_insertion = (
+        n_ins > 0 and any(v > 0 for v in insertion_vacuum_points)
+    )
+
+    # 真空存在但 electrolyte_vacuum_points == 0 => 真空全部在电极区。
+    vacuum_in_electrode_only = (
+        vacuum_detected
+        and not vacuum_in_insertion
+        and electrode_vacuum_points > 0
+    )
+
     return {
         "bulk_density": bulk_density,
         "bulk_points": len(bulk_values),
@@ -1178,6 +1305,17 @@ def analyze_density_profile(xvg_path, summary, target_density):
 
         "electrode_vacuum_weight": ELECTRODE_VACUUM_WEIGHT,
         "effective_vacuum_fraction": effective_vacuum_fraction,
+
+        # === 非电极（插入）子区域真空分布（用于分区域填充）===
+        "insertion_regions_nm": [
+            {"z_low": z_low, "z_high": z_high}
+            for z_low, z_high in insertion_regions
+        ],
+        "insertion_region_total_points": insertion_total_points,
+        "insertion_region_vacuum_points": insertion_vacuum_points,
+        "insertion_region_vacuum_fraction": insertion_region_vacuum_fraction,
+        "vacuum_in_insertion": vacuum_in_insertion,
+        "vacuum_in_electrode_only": vacuum_in_electrode_only,
     }
 
 
@@ -1315,6 +1453,26 @@ def measure_system(
         "effective_vacuum_fraction": density_analysis[
             "effective_vacuum_fraction"
         ],
+
+        # === 非电极（插入）子区域真空分布（用于分区域填充）===
+        "insertion_regions_nm": density_analysis.get(
+            "insertion_regions_nm", []
+        ),
+        "insertion_region_total_points": density_analysis.get(
+            "insertion_region_total_points", []
+        ),
+        "insertion_region_vacuum_points": density_analysis.get(
+            "insertion_region_vacuum_points", []
+        ),
+        "insertion_region_vacuum_fraction": density_analysis.get(
+            "insertion_region_vacuum_fraction", []
+        ),
+        "vacuum_in_insertion": density_analysis.get(
+            "vacuum_in_insertion", False
+        ),
+        "vacuum_in_electrode_only": density_analysis.get(
+            "vacuum_in_electrode_only", False
+        ),
     }
 
     state["measurements"].append(measurement)
@@ -2502,33 +2660,72 @@ def linear_prediction(n1, rho1, n2, rho2, target):
     return pred
 
 
+def largest_remainder_allocate(total, weights):
+    """
+    将 total 按 weights 比例分配为整数列表，总和严格等于 total。
+    与 incremental_add_molecules.py 中同名函数实现一致，确保跨脚本
+    计算口径相同。
+
+    若 weights 全为 0（例如所有 insertion 区域都没有真空），返回 [0]*n。
+    """
+    n = len(weights)
+    if total == 0 or n == 0:
+        return [0] * n
+
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return [0] * n
+
+    raw = [total * w / total_weight for w in weights]
+    base = [int(math.floor(x)) for x in raw]
+    remainder = total - sum(base)
+
+    order = sorted(
+        range(n),
+        key=lambda i: raw[i] - base[i],
+        reverse=True,
+    )
+
+    for i in range(remainder):
+        base[order[i % n]] += 1
+
+    return base
+
+
 def choose_vacuum_fill_trial(current_measurement):
     """
-    真空优先补充分子，并区分真空位于电解液区域还是电极区域。
+    真空优先补充分子，按真空出现位置分区域处理。
 
-    普通电解液区域真空：
-        权重 = 1.0
+    体系结构：
+        Z 方向被电极区域分成 3 个非电极（可插入）子区域
+        (lower / middle / upper insertion region)，加上上下两个电极区。
+        当真空出现时，整个体系并不均匀：其他区域接近正常密度，
+        因此不能再用整体真空比例估算补充分子数。
 
-    电极区域真空：
-        权重 = ELECTRODE_VACUUM_WEIGHT = 0.25
+    用户的分情况策略（b/c/d）：
+        b. 真空出现在非电极（插入）子区域时，按各子区域的真空比例
+           把补充分子数分配到出现真空的子区域，未出现真空的子区域填 0，
+           形如 [30, 0, 0]。计算公式与之前一致：
+               k = N_EMIM * f / (1 - f)
+           其中 f = electrolyte_vacuum_fraction（即非电极区真空比例）。
+           填充仅作用于真空子区域。
+        c. 真空仅出现在电极区域时，保留旧的加权逻辑
+           (electrode 贡献按 ELECTRODE_VACUUM_WEIGHT = 0.25 计算)，
+           并且按默认厚度加权把分子分配到全部 3 个插入子区域。
+        d. 真空同时存在于非电极区与电极区时，优先按 (b) 处理非电极区，
+           电极区真空在本轮忽略。
 
-    因此先计算等效真空比例：
+    返回签名（与 choose_next_trial 其它分支保持一致，多一个
+    region_allocations）：
+        (parent_measurement, target_emim, region_allocations, reason)
 
-        f_eff
-        = f_electrolyte
-          + 0.25 * f_electrode
-
-    再按原来的体积缺失估计：
-
-        k_raw = N_EMIM * f_eff / (1 - f_eff)
-
-    这样：
-    - 真空全部位于电解液区域 -> 使用正常增加量；
-    - 真空全部位于电极区域 -> 贡献约为正常增加量的 1/4；
-    - 同时存在两类真空 -> 分别加权后合并。
-
-    最终仍受 VACUUM_MAX_STEP_FRACTION 限制，
-    且真正添加的组分继续由 1:1:5 规则控制。
+    其中 region_allocations:
+        None          => 由 incremental_add_molecules.py 用默认厚度加权
+                         分配到全部 3 个插入子区域（case c）。
+        dict          => 显式指定每个分子在三个子区域的填充数量，
+                         形如 {"EMIM":[30,0,0], "BF4":[30,0,0],
+                                "ACN":[150,0,0]}（case b/d）。
+                         每个 mol 的三段之和必须等于 added[mol]。
     """
     current_n = int(
         current_measurement["composition"]["EMIM"]
@@ -2569,13 +2766,54 @@ def choose_vacuum_fill_trial(current_measurement):
             "但 vacuum_fraction <= 0。"
         )
 
-    if effective_f <= 0.0:
-        # 理论上不会发生，但为了防止旧状态文件缺字段。
-        effective_f = (
-            total_f * ELECTRODE_VACUUM_WEIGHT
+    # ----------------------------------------------------------------
+    # 判定真空位置（b/c/d）
+    # ----------------------------------------------------------------
+    insertion_region_f = list(
+        current_measurement.get(
+            "insertion_region_vacuum_fraction", []
         )
+    )
 
-    safe_f = min(effective_f, 0.95)
+    vacuum_in_insertion = bool(
+        current_measurement.get("vacuum_in_insertion", False)
+    )
+
+    vacuum_in_electrode_only = bool(
+        current_measurement.get(
+            "vacuum_in_electrode_only", False
+        )
+    )
+
+    # 缺少 packmol_insertion_regions_nm（旧 summary）时，无法按子区域
+    # 分配，统一退回到旧的加权 + 默认分配逻辑。
+    has_insertion_split = (
+        len(insertion_region_f) == 3
+    )
+
+    if vacuum_in_insertion and has_insertion_split:
+        # 情况 b 或 d：优先填充非电极（插入）区。
+        # 用非电极区真空比例（electrolyte_f）作为 k 公式的 f，
+        # 电极区真空本轮不参与计算。
+        f_used = electrolyte_f
+        fill_kind = "insertion_subregion"
+    elif vacuum_in_electrode_only and has_insertion_split:
+        # 情况 c：仅电极区有真空，保留旧的加权逻辑
+        # (electrolyte_f=0, effective_f = 0.25 * electrode_f)。
+        f_used = effective_f
+        fill_kind = "electrode_default"
+    else:
+        # 退化分支：summary 不含 packmol_insertion_regions_nm，
+        # 或同时既无 insertion 真空也非 electrode_only（极少见），
+        # 退回到旧的 effective 加权逻辑，且 region_allocations=None。
+        f_used = effective_f
+        fill_kind = "legacy_default"
+
+    if f_used <= 0.0:
+        # 旧 state 文件缺字段时的兜底：用 total_f * 权重。
+        f_used = total_f * ELECTRODE_VACUUM_WEIGHT
+
+    safe_f = min(f_used, 0.95)
 
     raw_step = int(
         math.ceil(
@@ -2599,25 +2837,121 @@ def choose_vacuum_fill_trial(current_measurement):
 
     step = min(raw_step, max_step)
 
+    # ----------------------------------------------------------------
+    # 计算各组分实际新增量（严格遵守 1:1:5 增量规则）
+    # ----------------------------------------------------------------
+    comp = current_measurement["composition"]
+    solvent = (
+        "ACN" if int(comp.get("ACN", 0)) > 0 else "PC"
+    )
+    ratio = increment_ratio(solvent)
+
+    added = {mol: step * ratio[mol] for mol in MOLECULES}
+
+    # ----------------------------------------------------------------
+    # 区域分配
+    # ----------------------------------------------------------------
+    region_allocations = None  # 默认 None => 厚度加权分配到全部 3 区
+
+    if fill_kind == "insertion_subregion":
+        # 情况 b/d：按各插入子区域的真空比例把每组分到子区域。
+        # weights 即每个子区域的真空比例；非真空子区域 weight=0
+        # 自然得到 0，从而实现 [30, 0, 0] 这种分配。
+        weights = [max(0.0, float(x)) for x in insertion_region_f]
+
+        if sum(weights) <= 0.0:
+            # 极少见：vacuum_in_insertion 为 True 但所有子区域比例都是 0
+            # （例如真空切片落在 insertion 区域扣除的 MARGIN 边界外）。
+            # 退回到默认厚度加权分配，并在 reason 中标注。
+            region_allocations = None
+            fill_kind = "insertion_subregion_fallback_default"
+        else:
+            region_allocations = {}
+            for mol in MOLECULES:
+                if added[mol] <= 0:
+                    region_allocations[mol] = [0, 0, 0]
+                    continue
+                region_allocations[mol] = (
+                    largest_remainder_allocate(
+                        added[mol], weights
+                    )
+                )
+            # 校验：每个 mol 三段之和必须等于 added[mol]，
+            # 与 incremental_add_molecules.py 后续校验一致。
+            for mol in MOLECULES:
+                s = sum(region_allocations[mol])
+                if s != added[mol]:
+                    # largest_remainder_allocate 已经保证总和，
+                    # 这里只做防御性兜底。
+                    diff = added[mol] - s
+                    if diff != 0 and region_allocations[mol]:
+                        # 把差值补到权重最大的子区域。
+                        top_idx = max(
+                            range(3),
+                            key=lambda i: weights[i],
+                        )
+                        region_allocations[mol][top_idx] += diff
+
+    # fill_kind in (electrode_default, legacy_default,
+    #               insertion_subregion_fallback_default) => region_allocations=None
+
+    target_emim = current_n + step
+
+    # ----------------------------------------------------------------
+    # 组装可读 reason
+    # ----------------------------------------------------------------
+    if region_allocations is not None:
+        per_region_str = ", ".join(
+            f"ins{i}={region_allocations[mol][i]}"
+            for i in range(3)
+        )
+        ra_str = (
+            f"region_alloc EMIM=[{region_allocations['EMIM']}], "
+            f"BF4=[{region_allocations['BF4']}], "
+            f"{'ACN' if solvent == 'ACN' else 'PC'}="
+            f"[{region_allocations['ACN' if solvent == 'ACN' else 'PC']}]"
+        )
+    else:
+        per_region_str = ""
+        ra_str = "region_allocations=None (default thickness-weighted)"
+
     reason = (
-        "vacuum weighted fill: "
+        f"vacuum {fill_kind}: "
         f"total={total_f:.6f}, "
         f"electrolyte={electrolyte_f:.6f}*1.0, "
         f"electrode={electrode_f:.6f}"
         f"*{ELECTRODE_VACUUM_WEIGHT:.2f}, "
-        f"effective={effective_f:.6f}, "
+        f"f_used={f_used:.6f}, "
         f"raw_step={raw_step}, "
-        f"capped_step={step}"
+        f"capped_step={step}, "
+        f"{ra_str}"
     )
 
     return (
         current_measurement,
-        current_n + step,
+        target_emim,
+        region_allocations,
         reason,
     )
 
 
 def choose_next_trial(state, current_measurement):
+    """
+    预测下一体系的 EMIM 数量与可选的区域分配。
+
+    返回签名统一为：
+        (parent_measurement, target_emim, region_allocations, reason)
+
+    其中 region_allocations:
+        None => 由 incremental_add_molecules.py 用默认厚度加权分配
+                到全部 3 个插入子区域；
+        dict => 形如 {"EMIM":[k0,k1,k2], "BF4":[...], "ACN":[...]}
+                显式指定每个分子在三个子区域的填充数量，
+                三段之和必须等于 added[mol]。
+                只有在真空优先填充（choose_vacuum_fill_trial）且
+                真空位于非电极（插入）区时才会给出 dict；
+                其它分支一律返回 None。
+    """
     target_density = float(state["target_density"])
     stage = state["stage"]
 
@@ -2658,7 +2992,7 @@ def choose_next_trial(state, current_measurement):
         candidate = max(n_low + 1, candidate)
         candidate = min(n_high - 1, candidate)
 
-        return lower, candidate, reason
+        return lower, candidate, None, reason
 
     # 没有 upper，只能继续从低侧向上
     current_n = int(current_measurement["composition"]["EMIM"])
@@ -2688,6 +3022,7 @@ def choose_next_trial(state, current_measurement):
         return (
             current_measurement,
             current_n + step,
+            None,
             "initial proportional step",
         )
 
@@ -2722,7 +3057,7 @@ def choose_next_trial(state, current_measurement):
         candidate = current_n + max_step
         reason += " + step cap"
 
-    return current_measurement, candidate, reason
+    return current_measurement, candidate, None, reason
 
 
 def write_target_ratio(solvent_root, target_emim, target_comp):
@@ -2736,6 +3071,31 @@ def write_target_ratio(solvent_root, target_emim, target_comp):
     return path
 
 
+def write_region_allocations(solvent_root, target_emim, region_allocations):
+    """
+    将 choose_vacuum_fill_trial 给出的显式分区域填充数量
+    （形如 {"EMIM":[k0,k1,k2], "BF4":[...], "ACN":[...]}）写入
+    solvent_root/.density_region_alloc_<emim>.json，
+    供 incremental_add_molecules.py 通过 --region-allocations 读取。
+
+    若 region_allocations 为 None，则返回 None（不写文件）。
+    """
+    if region_allocations is None:
+        return None
+
+    path = (
+        Path(solvent_root)
+        / f".density_region_alloc_{target_emim}.json"
+    )
+
+    path.write_text(
+        json.dumps(region_allocations, indent=4, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    return path
+
+
 def ensure_target_system(
     solvent_root,
     solvent,
@@ -2743,6 +3103,7 @@ def ensure_target_system(
     target_emim,
     incremental_script,
     collection_root,
+    region_allocations=None,
 ):
     target_dir = Path(solvent_root) / str(target_emim)
 
@@ -2819,13 +3180,34 @@ def ensure_target_system(
         target_comp,
     )
 
+    # 若显式指定了分区域填充数量，则写入 JSON 并通过 CLI 透传给
+    # incremental_add_molecules.py；否则不传，让其使用默认厚度加权分配。
+    region_alloc_file = write_region_allocations(
+        solvent_root,
+        target_emim,
+        region_allocations,
+    )
+
+    cmd = [
+        sys.executable,
+        str(incremental_script),
+        str(parent_gro),
+        "--ratio", str(ratio_file),
+    ]
+
+    if region_alloc_file is not None:
+        cmd.extend(["--region-allocations", str(region_alloc_file)])
+        print(
+            "Region alloc    : "
+            f"{region_allocations} ({region_alloc_file.name})"
+        )
+    else:
+        print(
+            "Region alloc    : None (default thickness-weighted)"
+        )
+
     run_command(
-        [
-            sys.executable,
-            str(incremental_script),
-            str(parent_gro),
-            "--ratio", str(ratio_file),
-        ],
+        cmd,
         cwd=collection_root,
     )
 
@@ -2836,6 +3218,12 @@ def ensure_target_system(
         fail(f"增量脚本生成的体系不完整：{target_dir}")
 
     shutil.copy2(ratio_file, target_dir / "target_ratio.json")
+
+    if region_alloc_file is not None and region_alloc_file.is_file():
+        shutil.copy2(
+            region_alloc_file,
+            target_dir / "region_allocations.json",
+        )
 
     return target_dir.resolve()
 
@@ -2882,6 +3270,33 @@ def process_measurement(solvent_root, state, measurement):
         "  effective      : "
         f"{float(measurement.get('effective_vacuum_fraction', 0.0))*100.0:.4f}%"
     )
+
+    # 非电极（插入）子区域真空分布
+    ins_f = list(
+        measurement.get("insertion_region_vacuum_fraction", [])
+    )
+    ins_pts = list(
+        measurement.get("insertion_region_vacuum_points", [])
+    )
+    if len(ins_f) == 3:
+        labels = ("lower", "middle", "upper")
+        print("  insertion sub :")
+        for i, f_i in enumerate(ins_f):
+            pts_i = ins_pts[i] if i < len(ins_pts) else 0
+            print(
+                f"    {labels[i]:6s}: "
+                f"{float(f_i)*100.0:.4f}% "
+                f"(vacuum_pts={pts_i})"
+            )
+        print(
+            "  vacuum_in_insertion       : "
+            f"{measurement.get('vacuum_in_insertion', False)}"
+        )
+        print(
+            "  vacuum_in_electrode_only  : "
+            f"{measurement.get('vacuum_in_electrode_only', False)}"
+        )
+
     print(
         f"Vacuum threshold : "
         f"{float(measurement.get('vacuum_threshold', 0.0)):.6f}"
@@ -2907,7 +3322,7 @@ def process_measurement(solvent_root, state, measurement):
 
         print(
             "局部真空存在：本轮禁止进入 coarse/fine 收敛判定，"
-            "下一步将优先按真空比例补充分子。"
+            "下一步将优先按真空位置（非电极优先）补充分子。"
         )
 
         return "continue"
@@ -3128,10 +3543,12 @@ def main():
             return
 
         # 4. 预测下一体系
-        parent_measurement, target_emim, reason = choose_next_trial(
-            state,
-            measurement,
-        )
+        (
+            parent_measurement,
+            target_emim,
+            region_allocations,
+            reason,
+        ) = choose_next_trial(state, measurement)
 
         print("\n[NEXT TRIAL]")
         print(
@@ -3140,6 +3557,11 @@ def main():
         )
         print(f"Target EMIM     : {target_emim}")
         print(f"Prediction      : {reason}")
+        if region_allocations is not None:
+            print(
+                "Region alloc    : "
+                f"{region_allocations}"
+            )
 
         # 5. 从父体系按严格 1:1:5 生成下一体系
         next_dir = ensure_target_system(
@@ -3149,6 +3571,7 @@ def main():
             target_emim=target_emim,
             incremental_script=incremental_script,
             collection_root=collection_root,
+            region_allocations=region_allocations,
         )
 
         state["current_trial_dir"] = str(next_dir)
