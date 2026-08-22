@@ -1564,6 +1564,105 @@ def measure_system(
     existing = find_measurement_by_dir(state, system_dir)
 
     if existing is not None:
+        # 兼容旧 state：早期 measurement 没有电极/电解液分类字段
+        # (electrolyte_vacuum_fraction, vacuum_in_insertion,
+        # insertion_region_vacuum_fraction 等)。
+        # 此时直接复用旧记录会让 choose_vacuum_fill_trial 把所有比例
+        # 当成 0，导致掉到 legacy_default 兜底分支，分子按厚度加权
+        # 分散到全部 3 个区，而不是只填到出现真空的子区域。
+        #
+        # 修复策略：density.xvg 已存在时，仅重新调用
+        # analyze_density_profile 补全新字段并替换 state 中那条记录；
+        # 不重跑 gmx density，避免重复消耗 NVT 后的轨迹分析。
+        needs_reanalyze = not all(
+            k in existing
+            for k in (
+                "electrolyte_vacuum_fraction",
+                "electrode_vacuum_fraction",
+                "effective_vacuum_fraction",
+                "vacuum_in_insertion",
+                "vacuum_in_electrode_only",
+                "insertion_region_vacuum_fraction",
+            )
+        )
+
+        if needs_reanalyze:
+            print(
+                f"体系已有密度记录（{existing['density']}），"
+                "但缺少电极/电解液分类字段，"
+                "重新解析 density.xvg 补全..."
+            )
+
+            summary, _ = load_summary(system_dir)
+            xvg = Path(system_dir) / "first" / "density.xvg"
+
+            if not xvg.is_file():
+                # xvg 不在了，没办法补全，走原复用路径，
+                # 后续打印和 choose_vacuum_fill_trial 用默认 0 处理。
+                print(
+                    "density.xvg 不存在，无法重新解析，"
+                    "仍按旧记录复用（分类字段保留默认 0）。"
+                )
+                return existing
+
+            density_analysis = analyze_density_profile(
+                xvg_path=xvg,
+                summary=summary,
+                target_density=float(state["target_density"]),
+            )
+
+            # 把新分析结果就地合并进 existing，并保持旧的
+            # density/composition/stage/measured_at 不变。
+            existing.update(
+                {
+                    "vacuum_detected": density_analysis["vacuum_detected"],
+                    "vacuum_fraction": density_analysis["vacuum_fraction"],
+                    "vacuum_threshold": density_analysis["vacuum_threshold"],
+                    "vacuum_points": density_analysis["vacuum_points"],
+                    "accessible_points": density_analysis["accessible_points"],
+                    "vacuum_segments": density_analysis["vacuum_segments"],
+                    "electrode_vacuum_points": density_analysis[
+                        "electrode_vacuum_points"
+                    ],
+                    "electrolyte_vacuum_points": density_analysis[
+                        "electrolyte_vacuum_points"
+                    ],
+                    "electrode_vacuum_fraction": density_analysis[
+                        "electrode_vacuum_fraction"
+                    ],
+                    "electrolyte_vacuum_fraction": density_analysis[
+                        "electrolyte_vacuum_fraction"
+                    ],
+                    "electrode_vacuum_weight": density_analysis[
+                        "electrode_vacuum_weight"
+                    ],
+                    "effective_vacuum_fraction": density_analysis[
+                        "effective_vacuum_fraction"
+                    ],
+                    "insertion_regions_nm": density_analysis.get(
+                        "insertion_regions_nm", []
+                    ),
+                    "insertion_region_total_points": density_analysis.get(
+                        "insertion_region_total_points", []
+                    ),
+                    "insertion_region_vacuum_points": density_analysis.get(
+                        "insertion_region_vacuum_points", []
+                    ),
+                    "insertion_region_vacuum_fraction": density_analysis.get(
+                        "insertion_region_vacuum_fraction", []
+                    ),
+                    "vacuum_in_insertion": density_analysis.get(
+                        "vacuum_in_insertion", False
+                    ),
+                    "vacuum_in_electrode_only": density_analysis.get(
+                        "vacuum_in_electrode_only", False
+                    ),
+                }
+            )
+
+            save_state(solvent_root, state)
+            return existing
+
         print(f"体系已有密度记录，复用：{existing['density']}")
         return existing
 
