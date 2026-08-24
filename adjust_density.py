@@ -4095,10 +4095,35 @@ def main():
         try:
             target_emim_current = int(current_trial.name)
         except ValueError:
-            # refine_from_check 后 current_trial 可能是 fine_fail
-            # 快照目录（目录名不是数字），从 state["measurements"]
-            # 中按 directory 匹配找 composition。EMIM 推导。
+            # refine_from_check 后 current_trial 可能是 fine_fail 快照
+            # 目录（目录名不是数字）。state["measurements"] 里以
+            # directory 字段记录的仍是原 trial 路径（如 .../736），
+            # 不是 mv 后的 fine_fail 路径，所以 find_measurement_by_dir
+            # 直接匹配会失败。改为遍历 measurements 找 composition
+            # EMIM 与 fine_density 对应那条（refine 时已修改其 density
+            # 为 accepted density，并打 density_source 标签）。
             snap_meas = find_measurement_by_dir(state, current_trial)
+
+            if snap_meas is None and state.get("refined_from_check"):
+                # refine 路径：找打 refine 标签那条 measurement
+                for m in state.get("measurements", []):
+                    if m.get("density_source", "").startswith(
+                        "refined_from_check"
+                    ):
+                        snap_meas = m
+                        break
+
+            if snap_meas is None:
+                # 最后回退：找 fine_density 对应那条
+                fd = state.get("fine_density")
+                if fd is not None:
+                    for m in state.get("measurements", []):
+                        if abs(
+                            float(m.get("density", 0.0)) - float(fd)
+                        ) < 1e-6:
+                            snap_meas = m
+                            break
+
             if snap_meas is not None:
                 target_emim_current = int(
                     snap_meas["composition"]["EMIM"]
