@@ -2249,6 +2249,24 @@ def resolve_check_runtime(solvent_root, state):
             f"检查过：{snap_summary} 和 {root_summary}"
         )
 
+    # index.ndx 优先使用快照目录下的（save_snapshot 会把对应分子数
+    # 的 index.ndx 复制到 solvent_root/fine/index.ndx，即与 nvt.tpr 同级
+    # 在 fine/ 下而非 fine/first/ 下）。
+    # 若快照目录下没有 index.ndx，则回退到 solvent_root/index.ndx
+    # （base 体系就是 solvent_root 时两种路径其实是同一份文件）。
+    snapshot_index = solvent_root / snapshot_rel / "index.ndx"
+    root_index = solvent_root / "index.ndx"
+    if snapshot_index.is_file():
+        index_rel = f"{snapshot_rel}/index.ndx"
+        index_abs = snapshot_index
+    elif root_index.is_file():
+        index_rel = "index.ndx"
+        index_abs = root_index
+    else:
+        # 两个位置都没有，留给 run_check_density 报具体错误。
+        index_rel = f"{snapshot_rel}/index.ndx"
+        index_abs = snapshot_index
+
     runtime = {
         "runtime_root": solvent_root,
         "snapshot_rel": snapshot_rel,
@@ -2257,7 +2275,8 @@ def resolve_check_runtime(solvent_root, state):
         "first_abs": first_abs,
         "base_tpr_rel": f"{first_rel}/nvt.tpr",
         "base_cpt_rel": f"{first_rel}/nvt.cpt",
-        "index_rel": "index.ndx",
+        "index_rel": index_rel,
+        "index_abs": index_abs,
         "summary_path": summary_path,
         "resolved_from": src_label,
     }
@@ -2476,8 +2495,21 @@ def run_check_density(runtime_root, snapshot_rel, round_idx, begin_ps):
     xtc, xtc_label = _glob_latest(paths, "xtc")
     tpr = paths["tpr"]
     xvg = paths["xvg"]
-    # index.ndx 默认就放在 runtime_root 下（即 solvent_root）
-    index = runtime_root / "index.ndx"
+
+    # index.ndx 优先使用快照目录下的（save_snapshot 会把对应分子数
+    # 的 index.ndx 复制到 solvent_root/fine/index.ndx，即与 nvt.tpr
+    # 同级在 fine/ 下而非 fine/first/ 下）。
+    # 若快照目录下没有 index.ndx，则回退到 runtime_root/index.ndx
+    # （base 体系就是 solvent_root 时两种路径其实是同一份文件）。
+    snapshot_index = runtime_root / snapshot_rel / "index.ndx"
+    root_index = runtime_root / "index.ndx"
+    if snapshot_index.is_file():
+        index = snapshot_index
+    elif root_index.is_file():
+        index = root_index
+    else:
+        # 两个位置都没有，留给下面的存在性检查报具体错误。
+        index = snapshot_index
 
     if xvg.is_file():
         print(f"第 {round_idx} 轮 check 密度已存在，复用：{xvg}")
@@ -2492,6 +2524,7 @@ def run_check_density(runtime_root, snapshot_rel, round_idx, begin_ps):
         if not p.is_file():
             fail(f"check density 输入文件不存在：{name} -> {p}")
     print(f"第 {round_idx} 轮 check 用 xtc={xtc} ({xtc_label})")
+    print(f"第 {round_idx} 轮 check 用 index={index}")
 
     xtc_rel = str(xtc.relative_to(runtime_root))
     tpr_rel = str(tpr.relative_to(runtime_root))
