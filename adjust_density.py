@@ -2667,6 +2667,230 @@ def save_check_result(
     return measurement
 
 
+# ============================================================
+# Refine from check：接受最后一轮 check 密度作为真实密度
+# ============================================================
+
+
+def refine_from_check(solvent_root, state):
+    """
+    当 fine 三轮 5ns check 都未稳定（max_retries_exceeded）时调用。
+
+    思路：
+        1. 取最后一轮 check 测得的密度 ρ_check_last 作为体系真实密度；
+        2. 把原 fine 文件夹重命名为 fine_fail（保留失败记录便于排查），
+           不允许覆盖已存在的 fine_fail；
+        3. 在 state["measurements"] 中找原 fine 快照对应的 measurement
+           记录（按 final_density_result.json["directory"] 定位原始 trial
+           目录，再按目录匹配 measurement），把 density / relative_error
+           改为 ρ_check_last，并打 density_source 标签；
+        4. 根据 relative_error 自动判断 stage：|err| > coarse_tolerance
+           回 coarse，否则 fine；
+        5. 重置状态机为 running，清空 check_* 字段，更新 fine_density；
+        6. 同步 final_density_result.json：status 改回 RUNNING，
+           density / fine_density 改为 ρ_check_last；
+        7. 持久化后 return，由用户重新运行命令进入主循环。
+
+    安全：
+        - 只允许 refine 一次（state["refined_from_check"] == True 后
+          再次调用直接 fail）；
+        - 重命名 fine -> fine_fail 前检查 fine_fail 是否已存在。
+    """
+    solvent_root = Path(solvent_root).resolve()
+
+    # --------------------------------------------------------
+    # 0. 安全检查
+    # --------------------------------------------------------
+    if state.get("refined_from_check"):
+        fail(
+            "已经 refine 过一次（state.refined_from_check=True），"
+            "再次失败请人工检查体系，不再自动 refine。"
+        )
+
+    if state.get("check_status") != "max_retries_exceeded":
+        fail(
+            "refine_from_check 只能在 check_status="
+            "max_retries_exceeded 时调用，"
+            f"当前 check_status={state.get('check_status')!r}。"
+        )
+
+    check_ms = state.get("check_measurements", [])
+    if not check_ms:
+        fail("state.check_measurements 为空，没有 check 记录可参考。")
+
+    last_check = check_ms[-1]
+    rho_check_last = float(last_check["density"])
+
+    target = float(state["target_density"])
+    rel_error = (rho_check_last - target) / target
+
+    # --------------------------------------------------------
+    # 1. 重命名 fine -> fine_fail
+    # --------------------------------------------------------
+    fine_dir = Path(state["fine_directory"])
+    if not fine_dir.is_absolute():
+        fine_dir = solvent_root / fine_dir
+    fine_dir = fine_dir.resolve()
+
+    # 兼容历史脏值：fine_directory 可能等于 solvent_root 本身，
+    # 此时真正的 fine 快照在 solvent_root/fine。
+    if fine_dir == solvent_root:
+        fine_dir = solvent_root / FINE_SNAPSHOT_DIR
+
+    fail_dir = solvent_root / "fine_fail"
+
+    if fail_dir.exists():
+        fail(
+            f"目标目录已存在，无法重命名：{fail_dir}\n"
+            "请手动清理或备份后重试。"
+        )
+
+    if not fine_dir.is_dir():
+        fail(
+            f"原 fine 快照目录不存在：{fine_dir}\n"
+            "无法执行 refine，请人工检查 fine_directory 字段。"
+        )
+
+    shutil.move(str(fine_dir), str(fail_dir))
+    print(
+        f"已将原 fine 快照重命名为 fine_fail：\n"
+        f"  {fine_dir}\n  -> {fail_dir}"
+    )
+
+    # --------------------------------------------------------
+    # 2. 定位原 fine 快照对应的 measurement 记录并修改密度
+    # --------------------------------------------------------
+    # final_density_result.json["directory"] 记录的是原始 trial 目录
+    # （即 save_final_result 时 measurement["directory"]），用它来
+    # 在 state["measurements"] 中匹配。
+    result_path = solvent_root / FINAL_RESULT_JSON
+    final_result = {}
+    if result_path.is_file():
+        try:
+            final_result = json.loads(
+                result_path.read_text(encoding="utf-8")
+            )
+        except Exception:
+            final_result = {}
+
+    orig_trial_dir = final_result.get("directory")
+    fine_meas = None
+    if orig_trial_dir:
+        fine_meas = find_measurement_by_dir(state, orig_trial_dir)
+
+    if fine_meas is None:
+        # 回退：按 fine 快照本身目录找（极少见，但兼容）
+        fine_meas = find_measurement_by_dir(state, fine_dir)
+
+    if fine_meas is None:
+        fail(
+            "在 state.measurements 中找不到原 fine 快照对应的记录"
+            f"（尝试 directory={orig_trial_dir} 和 {fine_dir}），"
+            "无法修改密度。请人工检查 state 文件。"
+        )
+
+    fine_meas["density"] = rho_check_last
+    fine_meas["relative_error"] = rel_error
+    fine_meas["density_source"] = (
+        f"refined_from_check_r{last_check.get('round', '?')}"
+    )
+    # 保留旧 fine_density 便于追溯
+    fine_meas["pre_refine_density"] = float(state.get("fine_density", 0.0))
+
+    print(
+        f"\n已修改原 fine measurement 密度：\n"
+        f"  directory     : {fine_meas['directory']}\n"
+        f"  旧 density    : {fine_meas['pre_refine_density']:.6f}\n"
+        f"  新 density    : {rho_check_last:.6f}\n"
+        f"  relative_error: {rel_error*100.0:.4f}%\n"
+        f"  density_source: {fine_meas['density_source']}"
+    )
+
+    # --------------------------------------------------------
+    # 3. 自动判断 stage
+    # --------------------------------------------------------
+    coarse_tol = float(state.get("coarse_tolerance", COARSE_TOLERANCE))
+    if abs(rel_error) > coarse_tol:
+        new_stage = "coarse"
+    else:
+        new_stage = "fine"
+
+    print(
+        f"\n[stage 判断] |rel_error|={abs(rel_error)*100.0:.4f}%，"
+        f"coarse_tolerance={coarse_tol*100.0:.1f}%，"
+        f"选定 stage={new_stage}"
+    )
+
+    # --------------------------------------------------------
+    # 4. 重置状态机
+    # --------------------------------------------------------
+    state["refined_from_check"] = True
+    state["refined_density"] = rho_check_last
+    state["status"] = "running"
+    state["stage"] = new_stage
+    state["current_trial_dir"] = str(fail_dir)  # 从 fine_fail 继续主循环
+    state["fine_density"] = rho_check_last
+    state["fine_directory"] = str(fail_dir)
+
+    # 清空 check 阶段进度（下次收敛后重新做 check）
+    state["check_status"] = "pending"
+    state["check_round"] = 0
+    state["check_measurements"] = []
+    state.pop("check_snapshot_rel", None)
+
+    # coarse_checkpoint 不动（保留原始 coarse 历史，便于 bracket_measurements）
+
+    save_state(solvent_root, state)
+
+    # --------------------------------------------------------
+    # 5. 同步 final_density_result.json
+    # --------------------------------------------------------
+    final_result["status"] = "RUNNING (refined from check)"
+    final_result["density"] = rho_check_last
+    final_result["fine_density"] = rho_check_last
+    final_result["relative_error"] = rel_error
+    final_result["refined_from_check"] = True
+    final_result["refined_density"] = rho_check_last
+    final_result["refined_at"] = now_string()
+    final_result["pre_refine_directory"] = orig_trial_dir
+    final_result["pre_refine_density"] = float(
+        fine_meas.get("pre_refine_density", 0.0)
+    )
+    # snapshot_directory / directory 仍指向原 trial，
+    # 但实际运行根目录已切到 fine_fail，由 resolve_check_runtime
+    # 在下次 check 时解析（fine_fail 含 first/nvt.tpr + nvt.cpt）。
+
+    result_path.write_text(
+        json.dumps(final_result, indent=4, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    # --------------------------------------------------------
+    # 6. 打印使用说明
+    # --------------------------------------------------------
+    print("\n" + "=" * 72)
+    print("REFINE FROM CHECK - 准备就绪")
+    print("=" * 72)
+    print(f"原 fine 快照     : {fail_dir} (已重命名)")
+    print(f"接受的密度       : {rho_check_last:.6f}")
+    print(f"目标密度         : {target:.6f}")
+    print(f"相对误差         : {rel_error*100.0:.4f}%")
+    print(f"新 stage          : {new_stage}")
+    print(f"current_trial_dir: {fail_dir}")
+    print(f"State file        : {solvent_root / STATE_JSON}")
+    print(f"Result file       : {result_path}")
+    print(
+        "\n下一步：请重新运行本脚本（不带 --refine-from-check），"
+        "程序将从 fine_fail 快照继续密度调节主循环：\n"
+        f"  python adjust_density.py <solvent_root> "
+        f"--target-density {target}"
+    )
+    print(
+        "注意：下次达到 fine 精度后会再次进入 5ns check；"
+        "若再次 max_retries_exceeded，不再自动 refine，需人工检查。"
+    )
+
+
 def run_post_convergence_check(
     solvent_root,
     state,
@@ -2721,7 +2945,7 @@ def run_post_convergence_check(
                 f"{last['relative_change'] * 100.0:.4f}%"
             )
         print(f"Result file     : {Path(solvent_root) / FINAL_RESULT_JSON}")
-        return
+        return "passed"
 
     if check_status == "max_retries_exceeded":
         warn(
@@ -2730,7 +2954,7 @@ def run_post_convergence_check(
             f"{Path(solvent_root) / FINAL_RESULT_JSON} 与 "
             f"{Path(solvent_root) / STATE_JSON} 中的 check_* 字段。"
         )
-        return
+        return "max_retries_exceeded"
 
     # ============================================================
     # 一次定位：resolve_check_runtime 统一解析 runtime + fine_density
@@ -2889,7 +3113,7 @@ def run_post_convergence_check(
                 "体系已确认稳定。"
             )
             print(f"Result file     : {Path(solvent_root) / FINAL_RESULT_JSON}")
-            return
+            return "passed"
 
     print("\n" + "=" * 72)
     print("POST-CONVERGENCE CHECK MAX RETRIES EXCEEDED")
@@ -2900,6 +3124,7 @@ def run_post_convergence_check(
         "结果已记录为 max_retries_exceeded，请人工检查体系。"
     )
     print(f"Result file     : {Path(solvent_root) / FINAL_RESULT_JSON}")
+    return "max_retries_exceeded"
 
 
 def distinct_measurements_by_emim(state):
@@ -3746,6 +3971,18 @@ def parse_args():
         help=f"最多评价体系数，默认 {MAX_ITERATIONS}。",
     )
 
+    parser.add_argument(
+        "--refine-from-check",
+        action="store_true",
+        help=(
+            "当 fine 三轮 5ns check 都未稳定（max_retries_exceeded）时，"
+            "接受最后一轮 check 测得的密度作为体系真实密度，"
+            "把原 fine 文件夹重命名为 fine_fail，"
+            "并以此真实密度为基准重新生成新体系继续密度调节。"
+            "只允许使用一次；再次失败请人工检查。"
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -3817,11 +4054,11 @@ def main():
     if state.get("status") == "converged":
         # 已收敛的体系，重新运行时进入 5ns check 流程：
         #   - check 已通过：直接报告完成
-        #   - check 已达最大重试：告警退出
+        #   - check 已达最大重试：告警退出（可 --refine-from-check 继续）
         #   - check 未完成：从中断点继续
         print("\n已有状态显示体系已经收敛，进入 5ns 续跑校验流程。")
         print(f"结果文件：{Path(solvent_root) / FINAL_RESULT_JSON}")
-        run_post_convergence_check(
+        check_outcome = run_post_convergence_check(
             solvent_root=solvent_root,
             state=state,
             nvt_mdp=nvt_mdp,
@@ -3829,6 +4066,14 @@ def main():
             mof_name=mof_dir.name,
             solvent=solvent,
         )
+
+        if (
+            check_outcome == "max_retries_exceeded"
+            and args.refine_from_check
+        ):
+            refine_from_check(solvent_root, state)
+            return
+
         return
 
     current_trial = Path(
@@ -3842,10 +4087,28 @@ def main():
         print(f"Current trial : {current_trial}")
 
         # 重建当前 trial 的 (parent_measurement, target_emim, step)：
-        # - target_emim_current 直接从 current_trial 目录名解析
+        # - target_emim_current 优先从 current_trial 目录名解析为数字；
+        #   若目录名不是数字（如 "fine" / "fine_fail" / "ACN" 等快照
+        #   目录名），从 state 的 fine measurement 推导分子数。
         # - parent_measurement 用 bracket_measurements 的 lower（最大的
         #   小于 target 的已测点），即为生成 current_trial 时所用父体系
-        target_emim_current = int(current_trial.name)
+        try:
+            target_emim_current = int(current_trial.name)
+        except ValueError:
+            # refine_from_check 后 current_trial 可能是 fine_fail
+            # 快照目录（目录名不是数字），从 state["measurements"]
+            # 中按 directory 匹配找 composition。EMIM 推导。
+            snap_meas = find_measurement_by_dir(state, current_trial)
+            if snap_meas is not None:
+                target_emim_current = int(
+                    snap_meas["composition"]["EMIM"]
+                )
+            else:
+                fail(
+                    f"无法从目录名解析分子数，且 state 中找不到"
+                    f"匹配的 measurement：{current_trial}"
+                )
+
         _lower, _upper = bracket_measurements(state)
         if _lower is not None:
             parent_measurement_current = _lower
@@ -3926,7 +4189,7 @@ def main():
             )
 
             # fine 收敛后，进入 5ns 续跑 + 重新校验密度流程
-            run_post_convergence_check(
+            check_outcome = run_post_convergence_check(
                 solvent_root=solvent_root,
                 state=state,
                 nvt_mdp=nvt_mdp,
@@ -3934,6 +4197,14 @@ def main():
                 mof_name=mof_dir.name,
                 solvent=solvent,
             )
+
+            if (
+                check_outcome == "max_retries_exceeded"
+                and args.refine_from_check
+            ):
+                refine_from_check(solvent_root, state)
+                return
+
             return
 
         # 4. 预测下一体系
