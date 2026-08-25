@@ -393,7 +393,7 @@ def prepare_input_structure(voltage_dir, source_gro, source_ndx):
 # 核心：单电压点单轮运行 (支持 convert-tpr 续跑)
 # ============================================================
 
-def run_one_voltage(voltage_dir, gmx, params, shared_files_dir):
+def run_one_voltage(voltage_dir, gmx, params, shared_files_dir, use_gpu=False):
     """
     对单个电压点执行一轮平衡检测。
     返回 True 表示已收敛，False 表示未收敛需继续循环。
@@ -406,11 +406,18 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir):
             mv nve.tpr → nve_loop{loop-1}.tpr
             convert-tpr -s nve_loop{loop-1}.tpr -extend 10000 -o nve.tpr
             mdrun -deffnm nve -cpi nve.cpt -append (轨迹追加)
+
+    use_gpu=True 时，mdrun 加 -nb gpu -pme gpu -pmefft gpu。
     """
     voltage_dir = Path(voltage_dir).resolve()
     print(f"\n{'=' * 60}")
     print(f"处理电压点：{voltage_dir.name} ({voltage_dir})")
     print(f"{'=' * 60}")
+
+    if use_gpu:
+        print("  mdrun 模式: GPU 加速 (-nb gpu -pme gpu -pmefft gpu)")
+    else:
+        print("  mdrun 模式: 纯 CPU")
 
     # 1. 读取当前轮次
     log_file = voltage_dir / DENSITY_LOG
@@ -496,6 +503,8 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir):
             "-ntmpi", "1", "-ntomp", "32",
             "-tunepme", "no", "-v", "-pin", "on", "-nstlist", "20",
         ]
+        if use_gpu:
+            mdrun_cmd += ["-nb", "gpu", "-pme", "gpu", "-pmefft", "gpu"]
         print("  首轮模式 (无 cpt)")
         run_command(mdrun_cmd, cwd=str(voltage_dir))
 
@@ -535,6 +544,8 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir):
             "-tunepme", "no", "-v", "-pin", "on", "-nstlist", "20",
             "-cpi", NVE_CPT, "-append",
         ]
+        if use_gpu:
+            mdrun_cmd += ["-nb", "gpu", "-pme", "gpu", "-pmefft", "gpu"]
         print("  续跑模式 (-cpi nve.cpt -append)")
         run_command(mdrun_cmd, cwd=str(voltage_dir))
 
@@ -597,7 +608,7 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir):
 # ============================================================
 
 def run_single_voltage(system_root, voltage_name, gmx, params,
-                       voltage_root, fine_gro, fine_ndx):
+                       voltage_root, fine_gro, fine_ndx, use_gpu=False):
     """只跑指定电压点，不进入其他电压点。"""
     vdir = system_root / voltage_name
     vdir.mkdir(parents=True, exist_ok=True)
@@ -641,7 +652,7 @@ def run_single_voltage(system_root, voltage_name, gmx, params,
         print(f"{'=' * 60}")
 
         converged = run_one_voltage(
-            vdir, gmx, params, system_root
+            vdir, gmx, params, system_root, use_gpu=use_gpu
         )
         if converged:
             break
@@ -697,6 +708,13 @@ def main():
         type=int,
         default=DEFAULT_MAX_LOOPS,
         help=f"每个电压点最大循环轮次，默认 {DEFAULT_MAX_LOOPS}",
+    )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        default=False,
+        help="启用 GPU 加速 mdrun：-nb gpu -pme gpu -pmefft gpu "
+             "(默认关闭，纯 CPU 运行)",
     )
     args = parser.parse_args()
 
@@ -782,7 +800,7 @@ def main():
     if args.voltage:
         run_single_voltage(
             system_root, args.voltage, args.gmx, params,
-            voltage_root, fine_gro, fine_ndx
+            voltage_root, fine_gro, fine_ndx, use_gpu=args.gpu
         )
         print(f"\n完成。")
         return
@@ -823,7 +841,8 @@ def main():
             print(f"{'=' * 60}")
 
             converged = run_one_voltage(
-                zero_v_dir, args.gmx, params, system_root
+                zero_v_dir, args.gmx, params, system_root,
+                use_gpu=args.gpu
             )
             if converged:
                 break
@@ -878,7 +897,8 @@ def main():
         next_pending = []
         for vd in pending:
             converged = run_one_voltage(
-                vd, args.gmx, params, system_root
+                vd, args.gmx, params, system_root,
+                use_gpu=args.gpu
             )
             if not converged:
                 next_pending.append(vd)
