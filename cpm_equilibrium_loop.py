@@ -561,12 +561,17 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
                 f"请在 {shared_files_dir} 下准备 {GROMPP_MDP} 和 {GROMPP_50NS_MDP}"
             )
 
-        dst_mdp = voltage_dir / GROMPP_MDP
+        # 保持原文件名复制到工作目录 (不重命名为 grompp.mdp)。
+        # 这样 grompp 命令行的 -f 参数直接反映是 50ns 还是 10ns，
+        # 避免用户从日志看到 -f grompp.mdp 误以为用的是 10ns。
+        mdp_basename = use_mdp.name
+        dst_mdp = voltage_dir / mdp_basename
         shutil.copy(str(use_mdp), str(dst_mdp))
+        print(f"  复制 mdp -> {dst_mdp}")
 
-        # grompp
+        # grompp (-f 使用与源一致的文件名，保留 _50ns 后缀语义)
         run_command(
-            [gmx, "grompp", "-f", GROMPP_MDP, "-c", START_GRO,
+            [gmx, "grompp", "-f", mdp_basename, "-c", START_GRO,
              "-o", NVE_TPR, "-n", INDEX_NDX, "-maxwarn", "1"],
             cwd=str(voltage_dir),
             env=gmx_env,
