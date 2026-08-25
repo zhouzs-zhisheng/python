@@ -427,36 +427,42 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir, use_gpu=False):
     loop, is_first = read_last_loop(log_file)
     print(f"  当前轮次: loop={loop}, is_first={is_first}")
 
-    # 2. 检查电荷文件
+    # 2. 续跑前先检查是否已收敛
+    #    注意：首轮 / 文件不存在时跳过，mdrun 会首次生成电荷文件；
+    #    只有续跑 (非首轮) 时缺少电荷文件才视为异常。
     charge_file = voltage_dir / CHARGE_FILE
-    if not charge_file.is_file():
-        fail(f"{voltage_dir} 缺少电荷文件：{charge_file}")
-
-    # 3. 续跑前先检查是否已收敛
-    avg_charges = process_electrode_charge(
-        charge_file, CHARGE_INTERVAL_STEPS
-    )
-
-    if len(avg_charges) >= 2:
-        delta = (
-            (avg_charges[-1] - avg_charges[-2]) / avg_charges[-2]
+    pre_converged = False
+    if charge_file.is_file():
+        avg_charges = process_electrode_charge(
+            charge_file, CHARGE_INTERVAL_STEPS
         )
-        print(
-            f"  [续跑前] 电荷窗口数={len(avg_charges)}, "
-            f"最近两窗口: {avg_charges[-2]:.4f} -> {avg_charges[-1]:.4f}, "
-            f"delta={delta*100:.4f}%"
-        )
-        if abs(delta) < CHARGE_CONVERGENCE_THRESHOLD:
-            density = calc_average_density(
-                voltage_dir / CAT_XVG,
-                params["bulk_z_low"], params["bulk_z_high"]
-            ) if (voltage_dir / CAT_XVG).is_file() else 0.0
-            write_equilibrium_log(
-                voltage_dir, loop, avg_charges[-1], density
+        if len(avg_charges) >= 2:
+            delta = (
+                (avg_charges[-1] - avg_charges[-2]) / avg_charges[-2]
             )
-            return True
+            print(
+                f"  [续跑前] 电荷窗口数={len(avg_charges)}, "
+                f"最近两窗口: {avg_charges[-2]:.4f} -> {avg_charges[-1]:.4f}, "
+                f"delta={delta*100:.4f}%"
+            )
+            if abs(delta) < CHARGE_CONVERGENCE_THRESHOLD:
+                density = calc_average_density(
+                    voltage_dir / CAT_XVG,
+                    params["bulk_z_low"], params["bulk_z_high"]
+                ) if (voltage_dir / CAT_XVG).is_file() else 0.0
+                write_equilibrium_log(
+                    voltage_dir, loop, avg_charges[-1], density
+                )
+                return True
+        else:
+            print(f"  [续跑前] 电荷窗口数={len(avg_charges)} (<2)，需继续跑")
+    elif is_first:
+        print(f"  [续跑前] 首轮，电荷文件尚未生成，将在 mdrun 结束后检查")
     else:
-        print(f"  [续跑前] 电荷窗口数={len(avg_charges)} (<2)，需继续跑")
+        fail(
+            f"{voltage_dir} 缺少电荷文件：{charge_file}\n"
+            f"(非首轮模拟要求存在电荷文件以续跑)"
+        )
 
     # 4. 执行 NVE 模拟 (首次或续跑)
     start_gro = voltage_dir / START_GRO
