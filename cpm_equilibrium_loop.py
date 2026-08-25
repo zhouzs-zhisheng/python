@@ -728,16 +728,30 @@ def main():
         fail(f"体系根目录不存在：{system_root}")
 
     # 自动检测 voltage_root
+    # 优先级：
+    #   1. candidate 下有 allMatrixA.bin (最可靠标记，不能是 ACN/ 工作目录)
+    #   2. candidate 下 <电压值>/CPM_ControlFile.dat (例如 0V/CPM_ControlFile.dat)
+    #      存在 (控制文件按 <voltage_root>/<V>/CPM_ControlFile.dat 组织)
+    # 注意：不能用 candidate/0V 子目录是否存在判定，
+    #       因为 ACN/0V 是脚本自动创建的工作目录，
+    #       第一次重跑会误判 voltage_root=ACN。
     voltage_root = None
-    for candidate in [system_root, system_root.parent]:
-        if (candidate / ZERO_V).is_dir() or (
-            candidate / MATRIX_FILE
-        ).exists():
+    candidates = [system_root, system_root.parent]
+    # 先按 allMatrixA.bin 判定
+    for candidate in candidates:
+        if (candidate / MATRIX_FILE).is_file():
             voltage_root = candidate
             break
+    # 再按控制文件路径判定 (allMatrixA.bin 没找到时)
+    if voltage_root is None:
+        for candidate in candidates:
+            if (candidate / ZERO_V / CONTROL_FILE).is_file():
+                voltage_root = candidate
+                break
 
     if voltage_root is None:
-        voltage_root = system_root
+        # 都找不到就默认 system_root.parent，避免后续报误导性错误
+        voltage_root = system_root.parent
 
     print("=" * 72)
     print("CPM EQUILIBRIUM LOOP (NVE + convert-tpr 续跑)")
