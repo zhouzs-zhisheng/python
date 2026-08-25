@@ -39,7 +39,8 @@ cpm_equilibrium_loop.py
     ├── ACN/                      # = system_root
     │   ├── fine/
     │   │   ├── first/nvt.gro     # 0V 输入结构来源
-    │   │   └── index.ndx
+    │   │   ├── index.ndx         # 所有电压点共用
+    │   │   └── topol.top         # 拓扑 (所有电压点共用)
     │   ├── system_summary.json
     │   ├── grompp.mdp            # 10ns NVE 参数
     │   ├── grompp_50ns.mdp       # 50ns NVE 参数 (首轮)
@@ -98,6 +99,7 @@ NVE_LOG = "nve.log"
 GROMPP_MDP = "grompp.mdp"
 GROMPP_50NS_MDP = "grompp_50ns.mdp"
 INDEX_NDX = "index.ndx"
+TOPOL_TOP = "topol.top"
 CAT_XVG = "cat.xvg"
 SYSTEM_SUMMARY = "system_summary.json"
 
@@ -425,13 +427,14 @@ def prepare_voltage_files(voltage_dir, voltage_name, voltage_root):
         )
 
 
-def prepare_input_structure(voltage_dir, source_gro, source_ndx):
+def prepare_input_structure(voltage_dir, source_gro, source_ndx, source_topol):
     """
-    准备电压点的输入结构 start.gro 和 index.ndx。
+    准备电压点的输入结构 start.gro、index.ndx 和 topol.top。
 
     - 0V: 从 fine/first/nvt.gro 复制为 start.gro
     - 1V/2V/3V/4V: 从 0V/nve.gro 复制为 start.gro
     - index.ndx: 从 fine/index.ndx 复制 (所有电压点共用)
+    - topol.top: 从 fine/topol.top 复制 (所有电压点共用，拓扑不随电压变化)
     """
     voltage_dir = Path(voltage_dir).resolve()
 
@@ -455,7 +458,15 @@ def prepare_input_structure(voltage_dir, source_gro, source_ndx):
     else:
         print(f"  {INDEX_NDX} 已存在，跳过复制")
 
-
+    # topol.top (grompp 默认 -p topol.top，必须在 cwd 中存在)
+    dst_topol = voltage_dir / TOPOL_TOP
+    if not dst_topol.is_file():
+        if not Path(source_topol).is_file():
+            fail(f"topol.top 源文件不存在：{source_topol}")
+        shutil.copy(str(source_topol), str(dst_topol))
+        print(f"  复制 topol.top: {source_topol} -> {dst_topol}")
+    else:
+        print(f"  {TOPOL_TOP} 已存在，跳过复制")
 # ============================================================
 # 核心：单电压点单轮运行 (支持 convert-tpr 续跑)
 # ============================================================
@@ -690,7 +701,7 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
 # ============================================================
 
 def run_single_voltage(system_root, voltage_name, gmx, params,
-                       voltage_root, fine_gro, fine_ndx,
+                       voltage_root, fine_gro, fine_ndx, fine_topol,
                        use_gpu=False, gmx_env=None):
     """只跑指定电压点，不进入其他电压点。"""
     vdir = system_root / voltage_name
@@ -710,16 +721,16 @@ def run_single_voltage(system_root, voltage_name, gmx, params,
     print(f"\n--- 准备 {voltage_name} 输入结构 ---")
     if voltage_name == ZERO_V:
         # 0V: 从 fine 取
-        prepare_input_structure(vdir, fine_gro, fine_ndx)
+        prepare_input_structure(vdir, fine_gro, fine_ndx, fine_topol)
     else:
-        # 1V-4V: 从 0V 的 nve.gro 取
+        # 1V-4V: 从 0V 的 nve.gro 取 (拓扑仍是 fine/topol.top)
         zero_v_gro = system_root / ZERO_V / NVE_GRO
         if not zero_v_gro.is_file():
             fail(
                 f"0V 的 {NVE_GRO} 不存在：{zero_v_gro}\n"
                 f"请先跑 0V：python {sys.argv[0]} {system_root} --voltage 0V --gmx {gmx}"
             )
-        prepare_input_structure(vdir, zero_v_gro, fine_ndx)
+        prepare_input_structure(vdir, zero_v_gro, fine_ndx, fine_topol)
 
     # 准备矩阵和控制文件
     print(f"\n--- 准备 {voltage_name} 矩阵和控制文件 ---")
@@ -880,8 +891,13 @@ def main():
     fine_dir = system_root / "fine"
     fine_gro = fine_dir / "first" / "nvt.gro"
     fine_ndx = fine_dir / INDEX_NDX
+    fine_topol = fine_dir / TOPOL_TOP
 
-    # 0V 模式或完整流程都需要 fine 结构
+    # 0V 模式或完整流程都需要 fine 结构。
+    # topol.top 所有电压点共用，只要启动任务（包括单电压 1V-4V 模式）都要前置检查。
+    if not fine_topol.is_file():
+        fail(f"topol.top 源文件不存在：{fine_topol}\n请确认 fine 目录准备完整")
+
     if args.voltage == ZERO_V or args.voltage is None:
         if not fine_gro.is_file():
             fail(f"0V 输入结构不存在：{fine_gro}\n请确认 fine 收敛流程已完成")
@@ -891,6 +907,7 @@ def main():
     if args.voltage == ZERO_V:
         print(f"\n0V 输入结构来源 : {fine_gro}")
         print(f"index.ndx 来源  : {fine_ndx}")
+        print(f"topol.top 来源  : {fine_topol}")
 
     # 3. 检查共用 mdp 文件
     mdp_10ns = system_root / GROMPP_MDP
@@ -906,7 +923,7 @@ def main():
     if args.voltage:
         run_single_voltage(
             system_root, args.voltage, args.gmx, params,
-            voltage_root, fine_gro, fine_ndx,
+            voltage_root, fine_gro, fine_ndx, fine_topol,
             use_gpu=args.gpu, gmx_env=gmx_env,
         )
         print(f"\n完成。")
@@ -918,6 +935,7 @@ def main():
 
     print(f"\n0V 输入结构来源 : {fine_gro}")
     print(f"index.ndx 来源  : {fine_ndx}")
+    print(f"topol.top 来源  : {fine_topol}")
 
     # ---- Phase 0+1: 检测并运行 0V ----
     print(f"\n{'#' * 72}")
@@ -934,7 +952,7 @@ def main():
         zero_v_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"\n--- 准备 0V 输入结构 ---")
-        prepare_input_structure(zero_v_dir, fine_gro, fine_ndx)
+        prepare_input_structure(zero_v_dir, fine_gro, fine_ndx, fine_topol)
 
         print(f"\n--- 准备 0V 矩阵和控制文件 ---")
         prepare_voltage_files(zero_v_dir, ZERO_V, voltage_root)
@@ -977,7 +995,7 @@ def main():
         vdir.mkdir(parents=True, exist_ok=True)
 
         print(f"\n--- 准备 {vname} ---")
-        prepare_input_structure(vdir, zero_v_gro, fine_ndx)
+        prepare_input_structure(vdir, zero_v_gro, fine_ndx, fine_topol)
         prepare_voltage_files(vdir, vname, voltage_root)
 
     # ---- Phase 3: 循环跑 1V/2V/3V/4V ----
