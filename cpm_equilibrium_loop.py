@@ -343,7 +343,10 @@ def prepare_voltage_files(voltage_dir, voltage_name, voltage_root):
             print(f"  allMatrixA.bin 已存在 (非符号链接)，跳过")
 
     # 2. CPM_ControlFile.dat
-    ctrl_src = Path(voltage_root).resolve().parent / voltage_name / CONTROL_FILE
+    #    源在 voltage_root/<电压值>/CPM_ControlFile.dat
+    #    (对应原命令 cp ../../<电压值>/CPM_ControlFile.dat .
+    #     其中工作目录为 ACN/<电压值>，所以 voltage_root = <mof>/)
+    ctrl_src = Path(voltage_root).resolve() / voltage_name / CONTROL_FILE
     ctrl_dst = voltage_dir / CONTROL_FILE
 
     if ctrl_dst.is_file():
