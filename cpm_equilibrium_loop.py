@@ -10,17 +10,27 @@ cpm_equilibrium_loop.py
     Phase 0: 检测 0V 是否已完成 (有 new_equilibrium_result.log)
     Phase 1: 若 0V 未完成，准备 0V (从 fine 取 nvt.gro + index.ndx)
              并循环跑 0V 直到电荷收敛
-    Phase 2: 0V 完成后，用 0V 的 nvt.gro 作为 1V/2V/3V/4V 的输入结构，
+    Phase 2: 0V 完成后，用 0V 的 nve.gro 作为 1V/2V/3V/4V 的输入结构，
              准备各电压点 (ln -s allMatrixA.bin + cp CPM_ControlFile.dat)
     Phase 3: 循环跑 1V/2V/3V/4V 直到全部电荷收敛
 
+续跑机制：
+    - 首轮: grompp 生成 nve.tpr (50ns)，mdrun -deffnm nve
+    - 续跑: mv nve.tpr → nve_loop{N-1}.tpr，
+            convert-tpr -extend 10000 (延长 10ns) 生成新 nve.tpr，
+            mdrun -deffnm nve -cpi nve.cpt -append (轨迹追加到原 xtc)
+
 收敛判据：连续两个 5ns 窗口的平均电极电荷相对变化 < 0.5%。
-每个电压点独立平衡，无顺序依赖 (但都必须等 0V 完成后才能开始)。
 
 用法：
+    # 完整流程 (0V 优先 + 所有电压点)
     python cpm_equilibrium_loop.py <system_root> [--gmx GMX] [--max-loops 10]
 
+    # 单电压点模式 (只跑指定电压点)
+    python cpm_equilibrium_loop.py <system_root> --voltage 1V [--gmx GMX]
+
     system_root : ACN 目录 (其下有 fine/, system_summary.json)
+    --voltage   : 只跑指定电压点 (0V/1V/2V/3V/4V)，不进入其他电压点
     --gmx       : gmx 可执行文件路径，默认 gmx
     --max-loops : 每个电压点的最大循环轮次，默认 10
 
@@ -31,6 +41,8 @@ cpm_equilibrium_loop.py
     │   │   ├── first/nvt.gro     # 0V 输入结构来源
     │   │   └── index.ndx
     │   ├── system_summary.json
+    │   ├── grompp.mdp            # 10ns NVE 参数
+    │   ├── grompp_50ns.mdp       # 50ns NVE 参数 (首轮)
     │   ├── 0V/                   # 工作目录 (脚本自动创建)
     │   ├── 1V/
     │   ├── 2V/
@@ -73,16 +85,24 @@ DEFAULT_MAX_LOOPS = 10
 
 DENSITY_LOG = "density.log"
 EQUILIBRIUM_LOG = "new_equilibrium_result.log"
+
+# NVE 相关文件名 (从 NVT 改为 NVE)
 START_GRO = "start.gro"
-NVT_GRO = "nvt.gro"
-NVT_TPR = "nvt.tpr"
-NVT_CPT = "nvt.cpt"
-NVT_XTC = "nvt.xtc"
+NVE_GRO = "nve.gro"
+NVE_TPR = "nve.tpr"
+NVE_CPT = "nve.cpt"
+NVE_XTC = "nve.xtc"
+NVE_EDR = "nve.edr"
+NVE_LOG = "nve.log"
+
 GROMPP_MDP = "grompp.mdp"
 GROMPP_50NS_MDP = "grompp_50ns.mdp"
 INDEX_NDX = "index.ndx"
 CAT_XVG = "cat.xvg"
 SYSTEM_SUMMARY = "system_summary.json"
+
+# 续跑延长的时间 (ps)
+EXTEND_PS = 10000  # 10 ns = 10000 ps
 
 
 # ============================================================
@@ -308,11 +328,9 @@ def prepare_voltage_files(voltage_dir, voltage_name, voltage_root):
         fail(f"allMatrixA.bin 不存在：{matrix_src}")
 
     if not link_path.exists():
-        # 用绝对路径创建符号链接
         os.symlink(str(matrix_src), str(link_path))
         print(f"  创建符号链接: {link_path} -> {matrix_src}")
     else:
-        # 检查现有链接是否指向正确
         if link_path.is_symlink():
             target = os.readlink(str(link_path))
             if not Path(target).resolve().samefile(matrix_src):
@@ -325,8 +343,6 @@ def prepare_voltage_files(voltage_dir, voltage_name, voltage_root):
             print(f"  allMatrixA.bin 已存在 (非符号链接)，跳过")
 
     # 2. CPM_ControlFile.dat
-    #    源在 voltage_root.parent/<电压值>/CPM_ControlFile.dat
-    #    (对应原命令 ../../<电压值>/CPM_ControlFile.dat)
     ctrl_src = Path(voltage_root).resolve().parent / voltage_name / CONTROL_FILE
     ctrl_dst = voltage_dir / CONTROL_FILE
 
@@ -344,23 +360,23 @@ def prepare_voltage_files(voltage_dir, voltage_name, voltage_root):
 
 def prepare_input_structure(voltage_dir, source_gro, source_ndx):
     """
-    准备电压点的输入结构 nvt.gro 和 index.ndx。
+    准备电压点的输入结构 start.gro 和 index.ndx。
 
-    - 0V: 从 fine/first/nvt.gro 复制
-    - 1V/2V/3V/4V: 从 0V/nvt.gro 复制
+    - 0V: 从 fine/first/nvt.gro 复制为 start.gro
+    - 1V/2V/3V/4V: 从 0V/nve.gro 复制为 start.gro
     - index.ndx: 从 fine/index.ndx 复制 (所有电压点共用)
     """
     voltage_dir = Path(voltage_dir).resolve()
 
-    # nvt.gro
-    dst_gro = voltage_dir / NVT_GRO
+    # start.gro (输入结构)
+    dst_gro = voltage_dir / START_GRO
     if not dst_gro.is_file():
         if not Path(source_gro).is_file():
             fail(f"输入结构源文件不存在：{source_gro}")
         shutil.copy(str(source_gro), str(dst_gro))
         print(f"  复制输入结构: {source_gro} -> {dst_gro}")
     else:
-        print(f"  {NVT_GRO} 已存在，跳过复制")
+        print(f"  {START_GRO} 已存在，跳过复制")
 
     # index.ndx
     dst_ndx = voltage_dir / INDEX_NDX
@@ -374,13 +390,22 @@ def prepare_input_structure(voltage_dir, source_gro, source_ndx):
 
 
 # ============================================================
-# 核心：单电压点单轮运行
+# 核心：单电压点单轮运行 (支持 convert-tpr 续跑)
 # ============================================================
 
 def run_one_voltage(voltage_dir, gmx, params, shared_files_dir):
     """
     对单个电压点执行一轮平衡检测。
     返回 True 表示已收敛，False 表示未收敛需继续循环。
+
+    续跑逻辑：
+        Loop 1 (首次):
+            grompp -c start.gro -o nve.tpr (50ns)
+            mdrun -deffnm nve (无 cpt)
+        Loop 2+ (续跑):
+            mv nve.tpr → nve_loop{loop-1}.tpr
+            convert-tpr -s nve_loop{loop-1}.tpr -extend 10000 -o nve.tpr
+            mdrun -deffnm nve -cpi nve.cpt -append (轨迹追加)
     """
     voltage_dir = Path(voltage_dir).resolve()
     print(f"\n{'=' * 60}")
@@ -390,13 +415,14 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir):
     # 1. 读取当前轮次
     log_file = voltage_dir / DENSITY_LOG
     loop, is_first = read_last_loop(log_file)
+    print(f"  当前轮次: loop={loop}, is_first={is_first}")
 
     # 2. 检查电荷文件
     charge_file = voltage_dir / CHARGE_FILE
     if not charge_file.is_file():
         fail(f"{voltage_dir} 缺少电荷文件：{charge_file}")
 
-    # 3. 计算最近两个窗口的平均电荷
+    # 3. 续跑前先检查是否已收敛
     avg_charges = process_electrode_charge(
         charge_file, CHARGE_INTERVAL_STEPS
     )
@@ -406,7 +432,7 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir):
             (avg_charges[-1] - avg_charges[-2]) / avg_charges[-2]
         )
         print(
-            f"  电荷窗口数={len(avg_charges)}, "
+            f"  [续跑前] 电荷窗口数={len(avg_charges)}, "
             f"最近两窗口: {avg_charges[-2]:.4f} -> {avg_charges[-1]:.4f}, "
             f"delta={delta*100:.4f}%"
         )
@@ -420,79 +446,114 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir):
             )
             return True
     else:
-        print(f"  电荷窗口数={len(avg_charges)} (<2)，需继续跑")
+        print(f"  [续跑前] 电荷窗口数={len(avg_charges)} (<2)，需继续跑")
 
-    # 4. 准备续跑
+    # 4. 执行 NVE 模拟 (首次或续跑)
     start_gro = voltage_dir / START_GRO
-    nvt_gro = voltage_dir / NVT_GRO
+    nve_gro = voltage_dir / NVE_GRO
+    nve_tpr = voltage_dir / NVE_TPR
+    nve_cpt = voltage_dir / NVE_CPT
 
-    if nvt_gro.is_file():
-        shutil.copy(str(nvt_gro), str(start_gro))
-        print(f"  cp {NVT_GRO} -> {START_GRO}")
-    elif not start_gro.is_file():
-        fail(
-            f"{voltage_dir} 既无 {NVT_GRO} 也无 {START_GRO}，"
-            f"无法启动 NVT"
+    if is_first:
+        # ---- 首轮: grompp + mdrun ----
+        print(f"\n  --- 首轮 NVE (50ns) ---")
+
+        if not start_gro.is_file():
+            fail(
+                f"{voltage_dir} 缺少 {START_GRO}，"
+                f"无法启动首轮 NVE"
+            )
+
+        # 选择 mdp (优先 50ns，回退 10ns)
+        mdp_50ns = Path(shared_files_dir) / GROMPP_50NS_MDP
+        mdp_10ns = Path(shared_files_dir) / GROMPP_MDP
+
+        if mdp_50ns.is_file():
+            use_mdp = mdp_50ns
+            print(f"  首轮使用 50ns mdp：{use_mdp}")
+        elif mdp_10ns.is_file():
+            use_mdp = mdp_10ns
+            warn(f"50ns mdp 不存在，首轮使用 10ns mdp：{use_mdp}")
+        else:
+            fail(
+                f"找不到 mdp 文件：{mdp_10ns} 或 {mdp_50ns}\n"
+                f"请在 {shared_files_dir} 下准备 {GROMPP_MDP} 和 {GROMPP_50NS_MDP}"
+            )
+
+        dst_mdp = voltage_dir / GROMPP_MDP
+        shutil.copy(str(use_mdp), str(dst_mdp))
+
+        # grompp
+        run_command(
+            [gmx, "grompp", "-f", GROMPP_MDP, "-c", START_GRO,
+             "-o", NVE_TPR, "-n", INDEX_NDX, "-maxwarn", "1"],
+            cwd=str(voltage_dir),
         )
 
-    # 5. 准备 mdp (首轮 50ns，后续 10ns)
-    mdp_50ns = Path(shared_files_dir) / GROMPP_50NS_MDP
-    mdp_10ns = Path(shared_files_dir) / GROMPP_MDP
-
-    if is_first and mdp_50ns.is_file():
-        use_mdp = mdp_50ns
-        print(f"  首轮使用 50ns mdp：{use_mdp}")
-    elif mdp_10ns.is_file():
-        use_mdp = mdp_10ns
-        print(f"  使用 10ns mdp：{use_mdp}")
-    else:
-        fail(
-            f"找不到 mdp 文件：{mdp_10ns} 或 {mdp_50ns}\n"
-            f"请在 {shared_files_dir} 下准备 {GROMPP_MDP} 和 {GROMPP_50NS_MDP}"
-        )
-
-    dst_mdp = voltage_dir / GROMPP_MDP
-    shutil.copy(str(use_mdp), str(dst_mdp))
-
-    # 6. grompp
-    run_command(
-        [gmx, "grompp", "-f", GROMPP_MDP, "-c", START_GRO,
-         "-o", NVT_TPR, "-n", INDEX_NDX, "-maxwarn", "1"],
-        cwd=str(voltage_dir),
-    )
-
-    # 7. mdrun (续跑用 -cpi -append)
-    cpt = voltage_dir / NVT_CPT
-    if cpt.is_file():
+        # mdrun (首轮，无 cpt)
         mdrun_cmd = [
-            gmx, "mdrun", "-deffnm", "nvt",
-            "-ntmpi", "1", "-ntomp", "32",
-            "-tunepme", "no", "-v", "-pin", "on", "-nstlist", "20",
-            "-cpi", NVT_CPT, "-append",
-        ]
-        print("  续跑模式 (-cpi -append)")
-    else:
-        mdrun_cmd = [
-            gmx, "mdrun", "-deffnm", "nvt",
+            gmx, "mdrun", "-deffnm", "nve",
             "-ntmpi", "1", "-ntomp", "32",
             "-tunepme", "no", "-v", "-pin", "on", "-nstlist", "20",
         ]
         print("  首轮模式 (无 cpt)")
+        run_command(mdrun_cmd, cwd=str(voltage_dir))
 
-    run_command(mdrun_cmd, cwd=str(voltage_dir))
+    else:
+        # ---- 续跑: convert-tpr + mdrun -cpi -append ----
+        print(f"\n  --- 续跑 NVE (延长 {EXTEND_PS/1000}ns) ---")
 
-    # 8. 计算体相密度 (group 6)
+        if not nve_tpr.is_file():
+            fail(f"{voltage_dir} 缺少 {NVE_TPR}，无法续跑")
+        if not nve_cpt.is_file():
+            fail(f"{voltage_dir} 缺少 {NVE_CPT}，无法续跑")
+
+        # 1. 重命名上一轮的 nve.tpr → nve_loop{loop-1}.tpr
+        archived_tpr = voltage_dir / f"nve_loop{loop-1}.tpr"
+        if nve_tpr.is_file():
+            if archived_tpr.is_file():
+                # 已存在同名归档，先删掉 (或加后缀)
+                archived_tpr.unlink()
+            shutil.move(str(nve_tpr), str(archived_tpr))
+            print(f"  mv {NVE_TPR} -> {archived_tpr.name}")
+
+        # 2. convert-tpr 延长模拟时间
+        #    -extend <ps> 在原 tpr 末尾时间基础上延长
+        print(f"  convert-tpr -extend {EXTEND_PS} (延长 {EXTEND_PS/1000}ns)")
+        run_command(
+            [gmx, "convert-tpr",
+             "-s", str(archived_tpr),
+             "-extend", str(EXTEND_PS),
+             "-o", NVE_TPR],
+            cwd=str(voltage_dir),
+        )
+
+        # 3. mdrun 续跑 (-cpi -append，轨迹追加到原 nve.xtc)
+        mdrun_cmd = [
+            gmx, "mdrun", "-deffnm", "nve",
+            "-ntmpi", "1", "-ntomp", "32",
+            "-tunepme", "no", "-v", "-pin", "on", "-nstlist", "20",
+            "-cpi", NVE_CPT, "-append",
+        ]
+        print("  续跑模式 (-cpi nve.cpt -append)")
+        run_command(mdrun_cmd, cwd=str(voltage_dir))
+
+    # 5. 计算体相密度 (group 6)
     box_z_total = params["box_z_total"]
     sl = math.ceil(box_z_total / 0.01)
 
+    nve_xtc = voltage_dir / NVE_XTC
+    if not nve_xtc.is_file():
+        fail(f"{voltage_dir} 缺少 {NVE_XTC}，无法计算密度")
+
     run_command(
-        [gmx, "density", "-f", NVT_XTC, "-s", "nvt",
+        [gmx, "density", "-f", NVE_XTC, "-s", "nve",
          "-sl", str(sl), "-o", CAT_XVG],
         cwd=str(voltage_dir),
         stdin_text=f"{DENSITY_GROUP}\n",
     )
 
-    # 9. 算体相区间平均密度
+    # 6. 算体相区间平均密度
     density = calc_average_density(
         voltage_dir / CAT_XVG,
         params["bulk_z_low"], params["bulk_z_high"]
@@ -500,7 +561,7 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir):
     print(f"  体相密度 (z={params['bulk_z_low']:.2f}~"
           f"{params['bulk_z_high']:.2f} nm) = {density:.4f}")
 
-    # 10. 重新读电荷，计算 delta
+    # 7. 重新读电荷，计算 delta
     avg_charges = process_electrode_charge(
         charge_file, CHARGE_INTERVAL_STEPS
     )
@@ -509,17 +570,17 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir):
             (avg_charges[-1] - avg_charges[-2]) / avg_charges[-2]
         )
         print(
-            f"  续跑后电荷窗口数={len(avg_charges)}, "
+            f"  [续跑后] 电荷窗口数={len(avg_charges)}, "
             f"delta={delta*100:.4f}%"
         )
     else:
         delta = 1.0
         warn("续跑后电荷窗口仍 <2，无法判定收敛")
 
-    # 11. 写日志
+    # 8. 写日志
     append_density_log(log_file, loop, density)
 
-    # 12. 判收敛
+    # 9. 判收敛
     if abs(delta) < CHARGE_CONVERGENCE_THRESHOLD:
         write_equilibrium_log(
             voltage_dir, loop, avg_charges[-1], density
@@ -532,16 +593,99 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir):
 
 
 # ============================================================
+# 单电压点运行
+# ============================================================
+
+def run_single_voltage(system_root, voltage_name, gmx, params,
+                       voltage_root, fine_gro, fine_ndx):
+    """只跑指定电压点，不进入其他电压点。"""
+    vdir = system_root / voltage_name
+    vdir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'=' * 72}")
+    print(f"单电压点模式：{voltage_name}")
+    print(f"{'=' * 72}")
+
+    # 检查是否已收敛
+    if is_voltage_converged(vdir):
+        print(f"{voltage_name} 已收敛 (存在 {EQUILIBRIUM_LOG})")
+        print(f"如需重跑，请删除 {vdir / EQUILIBRIUM_LOG}")
+        return
+
+    # 准备输入结构
+    print(f"\n--- 准备 {voltage_name} 输入结构 ---")
+    if voltage_name == ZERO_V:
+        # 0V: 从 fine 取
+        prepare_input_structure(vdir, fine_gro, fine_ndx)
+    else:
+        # 1V-4V: 从 0V 的 nve.gro 取
+        zero_v_gro = system_root / ZERO_V / NVE_GRO
+        if not zero_v_gro.is_file():
+            fail(
+                f"0V 的 {NVE_GRO} 不存在：{zero_v_gro}\n"
+                f"请先跑 0V：python {sys.argv[0]} {system_root} --voltage 0V --gmx {gmx}"
+            )
+        prepare_input_structure(vdir, zero_v_gro, fine_ndx)
+
+    # 准备矩阵和控制文件
+    print(f"\n--- 准备 {voltage_name} 矩阵和控制文件 ---")
+    prepare_voltage_files(vdir, voltage_name, voltage_root)
+
+    # 循环跑
+    print(f"\n--- 运行 {voltage_name} 平衡循环 ---")
+    loop_count = 0
+    while loop_count < args_max_loops:
+        loop_count += 1
+        print(f"\n{'=' * 60}")
+        print(f"{voltage_name} LOOP {loop_count} / {args_max_loops}")
+        print(f"{'=' * 60}")
+
+        converged = run_one_voltage(
+            vdir, gmx, params, system_root
+        )
+        if converged:
+            break
+    else:
+        warn(
+            f"{voltage_name} 在 {args_max_loops} 轮后仍未收敛，"
+            f"请人工检查 {vdir}"
+        )
+
+    # 写单点汇总
+    if is_voltage_converged(vdir):
+        summary_path = system_root / EQUILIBRIUM_LOG
+        elog = vdir / EQUILIBRIUM_LOG
+        if elog.is_file():
+            content = elog.read_text(encoding="utf-8")
+            with open(summary_path, "w") as f:
+                f.write(f"SINGLE VOLTAGE POINT: {voltage_name}\n\n")
+                f.write(content)
+            print(f"汇总结果已写入：{summary_path}")
+
+
+# 全局变量 (由 main 设置，供 run_single_voltage 使用)
+args_max_loops = DEFAULT_MAX_LOOPS
+
+
+# ============================================================
 # 主流程
 # ============================================================
 
 def main():
+    global args_max_loops
+
     parser = argparse.ArgumentParser(
-        description="CPM 体系平衡检测循环 (0V 优先 + 多电压点)"
+        description="CPM 体系平衡检测循环 (0V 优先 + 多电压点 / 单电压点)"
     )
     parser.add_argument(
         "system_root",
         help="ACN 目录 (其下有 fine/, system_summary.json)",
+    )
+    parser.add_argument(
+        "--voltage",
+        choices=VOLTAGE_DIRS,
+        default=None,
+        help="只跑指定电压点 (0V/1V/2V/3V/4V)，不进入其他电压点",
     )
     parser.add_argument(
         "--gmx",
@@ -556,12 +700,13 @@ def main():
     )
     args = parser.parse_args()
 
+    args_max_loops = args.max_loops
+
     system_root = Path(args.system_root).resolve()
     if not system_root.is_dir():
         fail(f"体系根目录不存在：{system_root}")
 
-    # 自动检测 voltage_root：有 0V/ 和 allMatrixA.bin 的目录
-    # 优先 system_root 本身，其次 system_root.parent
+    # 自动检测 voltage_root
     voltage_root = None
     for candidate in [system_root, system_root.parent]:
         if (candidate / ZERO_V).is_dir() or (
@@ -571,21 +716,20 @@ def main():
             break
 
     if voltage_root is None:
-        # 都没有，默认用 system_root，让后续检查报具体错误
         voltage_root = system_root
 
-    # 但电压点工作目录在 system_root 下
-    # (ACN/0V, ACN/1V, ...)
-    # allMatrixA.bin 和 CPM_ControlFile.dat 源在 voltage_root 下
-
     print("=" * 72)
-    print("CPM EQUILIBRIUM LOOP (0V 优先 + 多电压点)")
+    print("CPM EQUILIBRIUM LOOP (NVE + convert-tpr 续跑)")
     print("=" * 72)
     print(f"System root  : {system_root}")
     print(f"Voltage root : {voltage_root}")
     print(f"GMX          : {args.gmx}")
     print(f"Max loops    : {args.max_loops}")
-    print(f"Voltage pts  : {VOLTAGE_DIRS}")
+    if args.voltage:
+        print(f"Mode         : 单电压点 ({args.voltage})")
+    else:
+        print(f"Mode         : 完整流程 (0V 优先 + 多电压点)")
+        print(f"Voltage pts  : {VOLTAGE_DIRS}")
 
     # 1. 加载 system_summary，推导参数
     summary = load_system_summary(system_root)
@@ -606,19 +750,23 @@ def main():
         f"收敛判据     : |delta_charge| < "
         f"{CHARGE_CONVERGENCE_THRESHOLD*100:.1f}%"
     )
+    print(f"续跑延长     : {EXTEND_PS/1000}ns/轮 (convert-tpr -extend)")
 
     # 2. 定位输入结构来源
     fine_dir = system_root / "fine"
-    fine_gro = fine_dir / "first" / NVT_GRO
+    fine_gro = fine_dir / "first" / "nvt.gro"
     fine_ndx = fine_dir / INDEX_NDX
 
-    if not fine_gro.is_file():
-        fail(f"0V 输入结构不存在：{fine_gro}\n请确认 fine 收敛流程已完成")
-    if not fine_ndx.is_file():
-        fail(f"index.ndx 源文件不存在：{fine_ndx}")
+    # 0V 模式或完整流程都需要 fine 结构
+    if args.voltage == ZERO_V or args.voltage is None:
+        if not fine_gro.is_file():
+            fail(f"0V 输入结构不存在：{fine_gro}\n请确认 fine 收敛流程已完成")
+        if not fine_ndx.is_file():
+            fail(f"index.ndx 源文件不存在：{fine_ndx}")
 
-    print(f"\n0V 输入结构来源 : {fine_gro}")
-    print(f"index.ndx 来源  : {fine_ndx}")
+    if args.voltage == ZERO_V:
+        print(f"\n0V 输入结构来源 : {fine_gro}")
+        print(f"index.ndx 来源  : {fine_ndx}")
 
     # 3. 检查共用 mdp 文件
     mdp_10ns = system_root / GROMPP_MDP
@@ -629,8 +777,24 @@ def main():
         warn(f"50ns mdp 不存在：{mdp_50ns}，首轮将使用 10ns mdp")
 
     # ============================================================
-    # Phase 0+1: 检测并运行 0V
+    # 单电压点模式
     # ============================================================
+    if args.voltage:
+        run_single_voltage(
+            system_root, args.voltage, args.gmx, params,
+            voltage_root, fine_gro, fine_ndx
+        )
+        print(f"\n完成。")
+        return
+
+    # ============================================================
+    # 完整流程 (0V 优先 + 多电压点)
+    # ============================================================
+
+    print(f"\n0V 输入结构来源 : {fine_gro}")
+    print(f"index.ndx 来源  : {fine_ndx}")
+
+    # ---- Phase 0+1: 检测并运行 0V ----
     print(f"\n{'#' * 72}")
     print("# Phase 0: 检测 0V 是否已完成")
     print(f"{'#' * 72}")
@@ -642,18 +806,14 @@ def main():
     else:
         print(f"0V 未完成，开始准备并运行 0V")
 
-        # 创建 0V 目录
         zero_v_dir.mkdir(parents=True, exist_ok=True)
 
-        # 准备输入结构 (从 fine 取)
         print(f"\n--- 准备 0V 输入结构 ---")
         prepare_input_structure(zero_v_dir, fine_gro, fine_ndx)
 
-        # 准备矩阵和控制文件
         print(f"\n--- 准备 0V 矩阵和控制文件 ---")
         prepare_voltage_files(zero_v_dir, ZERO_V, voltage_root)
 
-        # 循环跑 0V
         print(f"\n--- 运行 0V 平衡循环 ---")
         loop_count = 0
         while loop_count < args.max_loops:
@@ -675,17 +835,14 @@ def main():
 
         print(f"\n0V 已收敛！")
 
-    # ============================================================
-    # Phase 2: 准备 1V/2V/3V/4V (用 0V 的 nvt.gro 作为输入)
-    # ============================================================
+    # ---- Phase 2: 准备 1V/2V/3V/4V ----
     print(f"\n{'#' * 72}")
     print("# Phase 2: 准备 1V/2V/3V/4V")
     print(f"{'#' * 72}")
 
-    # 0V 的 nvt.gro 作为其他电压点的输入
-    zero_v_gro = zero_v_dir / NVT_GRO
+    zero_v_gro = zero_v_dir / NVE_GRO
     if not zero_v_gro.is_file():
-        fail(f"0V 的 {NVT_GRO} 不存在：{zero_v_gro}")
+        fail(f"0V 的 {NVE_GRO} 不存在：{zero_v_gro}")
 
     other_voltages = [v for v in VOLTAGE_DIRS if v != ZERO_V]
 
@@ -694,19 +851,14 @@ def main():
         vdir.mkdir(parents=True, exist_ok=True)
 
         print(f"\n--- 准备 {vname} ---")
-        # 输入结构：从 0V 的 nvt.gro 复制
         prepare_input_structure(vdir, zero_v_gro, fine_ndx)
-        # 矩阵和控制文件
         prepare_voltage_files(vdir, vname, voltage_root)
 
-    # ============================================================
-    # Phase 3: 循环跑 1V/2V/3V/4V
-    # ============================================================
+    # ---- Phase 3: 循环跑 1V/2V/3V/4V ----
     print(f"\n{'#' * 72}")
     print("# Phase 3: 运行 1V/2V/3V/4V 平衡循环")
     print(f"{'#' * 72}")
 
-    # 过滤掉已收敛的
     pending = []
     for vname in other_voltages:
         vdir = system_root / vname
@@ -739,9 +891,7 @@ def main():
             f"个电压点已收敛，{len(pending)} 个待续"
         )
 
-    # ============================================================
-    # 汇总结果
-    # ============================================================
+    # ---- 汇总结果 ----
     print(f"\n{'=' * 72}")
     print("FINAL STATUS")
     print(f"{'=' * 72}")
