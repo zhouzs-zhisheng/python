@@ -118,8 +118,71 @@ def warn(message):
     print(f"警告：{message}")
 
 
-def run_command(args, cwd=None, stdin_text=None):
+def build_gmx_env(gmx_path):
+    """
+    根据 gmx 可执行文件的位置，构造 subprocess 运行时使用的环境。
+
+    背景：用户交互式 shell 中 (通过 bashrc / module load / GMXRC) 配好了
+    LD_LIBRARY_PATH 以找到 libomp.so / libgromacs.so 等动态库；但 Python
+    subprocess 启动的是非登录非交互 shell，不一定继承这些设置。
+
+    策略：
+      1. 传入的 gmx_path 如果含目录 (非裸 "gmx")，则：
+           标准布局    <prefix>/bin/gmx    → 查 <prefix>/{lib,lib64}
+           嵌套布局    <prefix>/bin_all/bin/gmx
+                                         → 查 <prefix>/bin_all/{lib,lib64}
+                                           并 查 <prefix>/{lib,lib64}
+         将找到的目录注入子进程 LD_LIBRARY_PATH 最前端。
+      2. 继承 os.environ，这样用户在父 shell 里已设的 LD_LIBRARY_PATH
+         依然有效，不会丢失。
+    """
+    env = os.environ.copy()
+    if gmx_path is None:
+        return env
+    gmx_p = Path(gmx_path)
+    # 含目录的路径 (相对或绝对)：推断 lib 目录
+    if "/" in str(gmx_p) or "\\" in str(gmx_p):
+        try:
+            gmx_abs = gmx_p.resolve()
+        except (OSError, RuntimeError):
+            return env
+        # <prefix>/bin/gmx        → bin_dir = <prefix>/bin
+        # <prefix>/bin_all/bin/gmx → bin_dir = <prefix>/bin_all/bin
+        bin_dir = gmx_abs.parent
+        parents_to_try = [bin_dir.parent]               # <prefix> 或 <prefix>/bin_all
+        parents_to_try.append(parents_to_try[0].parent) # <prefix>/.. 或 <prefix>
+        extra_libs = []
+        seen = set()
+        for p in parents_to_try:
+            for libname in ("lib", "lib64"):
+                candidate = p / libname
+                if candidate.is_dir() and str(candidate) not in seen:
+                    extra_libs.append(str(candidate))
+                    seen.add(str(candidate))
+        if extra_libs:
+            existing = env.get("LD_LIBRARY_PATH", "")
+            prepend = ":".join(extra_libs)
+            if existing:
+                env["LD_LIBRARY_PATH"] = f"{prepend}:{existing}"
+            else:
+                env["LD_LIBRARY_PATH"] = prepend
+    return env
+
+
+def run_command(args, cwd=None, stdin_text=None, env=None):
+    """
+    运行外部命令。
+
+    env=None  时：subprocess 自动继承当前 Python 进程环境 (最常见情况)。
+    env=<dict>时：直接使用该字典作为子进程完整环境。
+
+    用法：所有 gmx 调用都应传入 build_gmx_env() 返回的 env，
+         确保 LD_LIBRARY_PATH 被正确注入以便找到 libomp.so 等。
+    """
     print(f"[CMD] {' '.join(args)}")
+    if env and env.get("LD_LIBRARY_PATH"):
+        injected_prefix = env["LD_LIBRARY_PATH"].split(os.pathsep)[0]
+        print(f"[ENV] LD_LIBRARY_PATH prepend: {injected_prefix}")
     try:
         result = subprocess.run(
             args,
@@ -129,6 +192,7 @@ def run_command(args, cwd=None, stdin_text=None):
             stderr=subprocess.STDOUT,
             check=True,
             text=True,
+            env=env,
         )
         if result.stdout:
             lines = result.stdout.splitlines()
@@ -143,7 +207,7 @@ def run_command(args, cwd=None, stdin_text=None):
             f"  {' '.join(args)}\n{detail}"
         )
     except FileNotFoundError:
-        fail(f"找不到外部命令：{args[0]}。请确认 gmx 路径正确。")
+        fail(f"找不到外部命令：{args[0]}。请确认 gmx 路径正确（使用 --gmx 绝对路径推荐）。")
 
 
 def load_system_summary(system_root):
@@ -396,7 +460,8 @@ def prepare_input_structure(voltage_dir, source_gro, source_ndx):
 # 核心：单电压点单轮运行 (支持 convert-tpr 续跑)
 # ============================================================
 
-def run_one_voltage(voltage_dir, gmx, params, shared_files_dir, use_gpu=False):
+def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
+                    use_gpu=False, gmx_env=None):
     """
     对单个电压点执行一轮平衡检测。
     返回 True 表示已收敛，False 表示未收敛需继续循环。
@@ -504,6 +569,7 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir, use_gpu=False):
             [gmx, "grompp", "-f", GROMPP_MDP, "-c", START_GRO,
              "-o", NVE_TPR, "-n", INDEX_NDX, "-maxwarn", "1"],
             cwd=str(voltage_dir),
+            env=gmx_env,
         )
 
         # mdrun (首轮，无 cpt)
@@ -515,7 +581,7 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir, use_gpu=False):
         if use_gpu:
             mdrun_cmd += ["-nb", "gpu", "-pme", "gpu", "-pmefft", "gpu"]
         print("  首轮模式 (无 cpt)")
-        run_command(mdrun_cmd, cwd=str(voltage_dir))
+        run_command(mdrun_cmd, cwd=str(voltage_dir), env=gmx_env)
 
     else:
         # ---- 续跑: convert-tpr + mdrun -cpi -append ----
@@ -544,6 +610,7 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir, use_gpu=False):
              "-extend", str(EXTEND_PS),
              "-o", NVE_TPR],
             cwd=str(voltage_dir),
+            env=gmx_env,
         )
 
         # 3. mdrun 续跑 (-cpi -append，轨迹追加到原 nve.xtc)
@@ -556,7 +623,7 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir, use_gpu=False):
         if use_gpu:
             mdrun_cmd += ["-nb", "gpu", "-pme", "gpu", "-pmefft", "gpu"]
         print("  续跑模式 (-cpi nve.cpt -append)")
-        run_command(mdrun_cmd, cwd=str(voltage_dir))
+        run_command(mdrun_cmd, cwd=str(voltage_dir), env=gmx_env)
 
     # 5. 计算体相密度 (group 6)
     box_z_total = params["box_z_total"]
@@ -571,6 +638,7 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir, use_gpu=False):
          "-sl", str(sl), "-o", CAT_XVG],
         cwd=str(voltage_dir),
         stdin_text=f"{DENSITY_GROUP}\n",
+        env=gmx_env,
     )
 
     # 6. 算体相区间平均密度
@@ -617,7 +685,8 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir, use_gpu=False):
 # ============================================================
 
 def run_single_voltage(system_root, voltage_name, gmx, params,
-                       voltage_root, fine_gro, fine_ndx, use_gpu=False):
+                       voltage_root, fine_gro, fine_ndx,
+                       use_gpu=False, gmx_env=None):
     """只跑指定电压点，不进入其他电压点。"""
     vdir = system_root / voltage_name
     vdir.mkdir(parents=True, exist_ok=True)
@@ -661,7 +730,8 @@ def run_single_voltage(system_root, voltage_name, gmx, params,
         print(f"{'=' * 60}")
 
         converged = run_one_voltage(
-            vdir, gmx, params, system_root, use_gpu=use_gpu
+            vdir, gmx, params, system_root,
+            use_gpu=use_gpu, gmx_env=gmx_env,
         )
         if converged:
             break
@@ -729,6 +799,9 @@ def main():
 
     args_max_loops = args.max_loops
 
+    # 一次性构造 gmx 子进程环境 (含 LD_LIBRARY_PATH 注入)
+    gmx_env = build_gmx_env(args.gmx)
+
     system_root = Path(args.system_root).resolve()
     if not system_root.is_dir():
         fail(f"体系根目录不存在：{system_root}")
@@ -765,6 +838,11 @@ def main():
     print(f"System root  : {system_root}")
     print(f"Voltage root : {voltage_root}")
     print(f"GMX          : {args.gmx}")
+    if gmx_env and gmx_env.get("LD_LIBRARY_PATH"):
+        injected = gmx_env["LD_LIBRARY_PATH"].split(os.pathsep)[0]
+        print(f"GMX lib path : {injected}  (LD_LIBRARY_PATH prepend)")
+    else:
+        print("GMX lib path : (未注入，使用进程继承环境)")
     print(f"Max loops    : {args.max_loops}")
     if args.voltage:
         print(f"Mode         : 单电压点 ({args.voltage})")
@@ -823,7 +901,8 @@ def main():
     if args.voltage:
         run_single_voltage(
             system_root, args.voltage, args.gmx, params,
-            voltage_root, fine_gro, fine_ndx, use_gpu=args.gpu
+            voltage_root, fine_gro, fine_ndx,
+            use_gpu=args.gpu, gmx_env=gmx_env,
         )
         print(f"\n完成。")
         return
@@ -865,7 +944,7 @@ def main():
 
             converged = run_one_voltage(
                 zero_v_dir, args.gmx, params, system_root,
-                use_gpu=args.gpu
+                use_gpu=args.gpu, gmx_env=gmx_env,
             )
             if converged:
                 break
@@ -921,7 +1000,7 @@ def main():
         for vd in pending:
             converged = run_one_voltage(
                 vd, args.gmx, params, system_root,
-                use_gpu=args.gpu
+                use_gpu=args.gpu, gmx_env=gmx_env,
             )
             if not converged:
                 next_pending.append(vd)
