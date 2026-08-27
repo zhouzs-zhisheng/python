@@ -3670,6 +3670,49 @@ def write_region_allocations(solvent_root, target_emim, region_allocations):
     return path
 
 
+def resolve_parent_gro(parent_dir):
+    """
+    选取父体系作为"下一体系增添模板"的结构文件。
+
+    用户要求：给体系增量加入离子（delta 分子）时，作为 packmol
+    parent_system.pdb 来源的应当是父体系最终、已平衡的 nvt.gro
+    （由 incremental_add_molecules.convert_parent_gro_to_pdb 经
+    `gmx editconf` 转成 pdb），而不是 Packmol 刚拼装好的初始
+    system.gro —— 这样 packmol 是在已经驰豫、无初始重叠的构象上
+    插入 delta 分子，物理上更合理，也不至于在初始几何上重复堆叠。
+
+    寻找顺序（已平衡优先）：
+        1. <parent>/first/nvt.gro          — 数字 trial 目录的标准 NVT 终态
+        2. <parent>/fine/first/nvt.gro     — base 快照 (solvent_root/fine/...)
+        3. <parent>/system.gro             — 回退：初始/当前结构
+
+    找不到任何一个 → fail。
+    """
+    parent_dir = Path(parent_dir).resolve()
+
+    candidates = [
+        ("first/nvt.gro", parent_dir / "first" / "nvt.gro"),
+        (
+            f"{FINE_SNAPSHOT_DIR}/first/nvt.gro",
+            parent_dir / FINE_SNAPSHOT_DIR / "first" / "nvt.gro",
+        ),
+        ("system.gro (fallback)", parent_dir / "system.gro"),
+    ]
+
+    for label, p in candidates:
+        if p.is_file():
+            print(f"  父体系增添模板: {label} -> {p}")
+            return p
+
+    fail(
+        f"父体系缺少可用的增添结构文件：\n"
+        f"  {parent_dir / 'first' / 'nvt.gro'}\n"
+        f"  {parent_dir / FINE_SNAPSHOT_DIR / 'first' / 'nvt.gro'}\n"
+        f"  {parent_dir / 'system.gro'}\n"
+        "请确认父体系已完成 NVT 模拟，或至少存在 system.gro。"
+    )
+
+
 def ensure_target_system(
     solvent_root,
     solvent,
@@ -3720,10 +3763,8 @@ def ensure_target_system(
         print("随后将从父体系重新执行本轮增量建模。")
 
     parent_dir = Path(parent_measurement["directory"]).resolve()
-    parent_gro = parent_dir / "system.gro"
-
-    if not parent_gro.is_file():
-        fail(f"父体系缺少 system.gro：{parent_gro}")
+    # 增添模板优先用父体系已平衡的最终 nvt.gro（经 editconf 转 parent_system.pdb）
+    parent_gro = resolve_parent_gro(parent_dir)
 
     _, parent_comp = load_summary(parent_dir)
 
