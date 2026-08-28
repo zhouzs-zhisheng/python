@@ -185,31 +185,41 @@ def run_command(args, cwd=None, stdin_text=None, env=None):
     if env and env.get("LD_LIBRARY_PATH"):
         injected_prefix = env["LD_LIBRARY_PATH"].split(os.pathsep)[0]
         print(f"[ENV] LD_LIBRARY_PATH prepend: {injected_prefix}")
+
+    stdin_pipe = subprocess.PIPE if stdin_text is not None else None
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             args,
             cwd=cwd,
-            input=stdin_text,
+            stdin=stdin_pipe,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            check=True,
             text=True,
+            bufsize=1,   # 行缓冲，配合逐行回显实现实时输出
             env=env,
-        )
-        if result.stdout:
-            lines = result.stdout.splitlines()
-            tail = lines[-20:] if len(lines) > 20 else lines
-            for line in tail:
-                print(f"  {line}")
-        return result
-    except subprocess.CalledProcessError as exc:
-        detail = exc.stdout or ""
-        fail(
-            f"命令执行失败 (返回码 {exc.returncode})：\n"
-            f"  {' '.join(args)}\n{detail}"
         )
     except FileNotFoundError:
         fail(f"找不到外部命令：{args[0]}。请确认 gmx 路径正确（使用 --gmx 绝对路径推荐）。")
+
+    # 先喂 stdin（gmx density 需传入组选择行），再关闭，避免管道写满死锁
+    if stdin_text is not None:
+        proc.stdin.write(stdin_text)
+        proc.stdin.close()
+
+    buffered = []
+    # 逐行实时回显到终端，同时累加留作失败诊断（长任务如 mdrun -v 进度实时可见）
+    for line in proc.stdout:
+        buffered.append(line)
+        print(f"  {line}", end="", flush=True)
+
+    proc.wait()
+    if proc.returncode != 0:
+        detail = "".join(buffered)[-4000:]
+        fail(
+            f"命令执行失败 (返回码 {proc.returncode})：\n"
+            f"  {' '.join(args)}\n{detail}"
+        )
+    return proc
 
 
 def load_system_summary(system_root):
