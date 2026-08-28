@@ -222,6 +222,24 @@ def run_command(args, cwd=None, stdin_text=None, env=None):
     return proc
 
 
+def enable_line_buffering():
+    """
+    非 TTY 重定向下（任务系统/nohup/管道）让 print 逐行落盘。
+
+    Python 在 stdout 非终端时改用 ~8KB 块缓冲：未带 flush=True 的 print
+    会攒到缓冲满或进程退出才一次性写出，导致 job 日志里看不到程序自身的
+    实时输出。这里把 stdout 切到行缓冲，使"每遇到一个换行即落盘"。
+    调用发生在 __main__ 启动处，仅作用于以脚本运行时。
+    """
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        if sys.stderr is not None and hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        # stdout/stderr 可能被替换为不支持 reconfigure 的自定义流，忽略保持默认
+        pass
+
+
 def load_system_summary(system_root):
     summary_path = Path(system_root) / SYSTEM_SUMMARY
     if not summary_path.is_file():
@@ -1108,4 +1126,5 @@ def main():
 
 
 if __name__ == "__main__":
+    enable_line_buffering()
     main()
