@@ -695,7 +695,7 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
         fail(f"{voltage_dir} 缺少 {NVE_XTC}，无法计算密度")
 
     run_command(
-        [gmx, "density", "-f", NVE_XTC, "-s", NVE_TPR,
+        [gmx, "density", "-f", NVE_XTC, "-s", NVE_TPR, "-n", INDEX_NDX,
          "-sl", str(sl), "-d", "Z", "-b", str(begin_ps), "-o", CAT_XVG],
         cwd=str(voltage_dir),
         stdin_text=f"{DENSITY_GROUP}\n",
