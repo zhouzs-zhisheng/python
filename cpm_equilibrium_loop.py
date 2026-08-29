@@ -99,7 +99,7 @@ GROMPP_MDP = "grompp.mdp"
 GROMPP_50NS_MDP = "grompp_50ns.mdp"
 INDEX_NDX = "index.ndx"
 TOPOL_TOP = "topol.top"
-CAT_XVG = "cat.xvg"
+DENSITY_XVG = "density.xvg"
 SYSTEM_SUMMARY = "system_summary.json"
 
 # 续跑延长的时间 (ps)
@@ -560,9 +560,9 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
             )
             if abs(delta) < CHARGE_CONVERGENCE_THRESHOLD:
                 density = calc_average_density(
-                    voltage_dir / CAT_XVG,
+                    voltage_dir / DENSITY_XVG,
                     params["bulk_z_low"], params["bulk_z_high"]
-                ) if (voltage_dir / CAT_XVG).is_file() else 0.0
+                ) if (voltage_dir / DENSITY_XVG).is_file() else 0.0
                 write_equilibrium_log(
                     voltage_dir, loop, avg_charges[-1], density
                 )
@@ -620,7 +620,7 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
         # grompp (-f 使用与源一致的文件名，保留 _50ns 后缀语义)
         run_command(
             [gmx, "grompp", "-f", mdp_basename, "-c", START_GRO,
-             "-o", NVE_TPR, "-n", INDEX_NDX, "-maxwarn", "1"],
+             "-o", NVE_TPR, "-n", INDEX_NDX, "-maxwarn", "6"],
             cwd=str(voltage_dir),
             env=gmx_env,
         )
@@ -696,7 +696,7 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
 
     run_command(
         [gmx, "density", "-f", NVE_XTC, "-s", NVE_TPR, "-n", INDEX_NDX,
-         "-sl", str(sl), "-d", "Z", "-b", str(begin_ps), "-o", CAT_XVG],
+         "-sl", str(sl), "-d", "Z", "-b", str(begin_ps), "-o", DENSITY_XVG],
         cwd=str(voltage_dir),
         stdin_text=f"{DENSITY_GROUP}\n",
         env=gmx_env,
@@ -704,7 +704,7 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
 
     # 6. 算体相区间平均密度
     density = calc_average_density(
-        voltage_dir / CAT_XVG,
+        voltage_dir / DENSITY_XVG,
         params["bulk_z_low"], params["bulk_z_high"]
     )
     print(f"  体相密度 (z={params['bulk_z_low']:.2f}~"
