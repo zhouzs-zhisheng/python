@@ -59,7 +59,6 @@ cpm_equilibrium_loop.py
 
 import argparse
 import json
-import math
 import os
 import shutil
 import subprocess
@@ -105,6 +104,16 @@ SYSTEM_SUMMARY = "system_summary.json"
 
 # 续跑延长的时间 (ps)
 EXTEND_PS = 10000  # 10 ns = 10000 ps
+
+# ---------- 密度统计参数 ----------
+# 首轮 NVE 时长 (ps)：默认 50 ns。若回退到 grompp.mdp (10ns) 使用，
+# 请相应改为 10000。
+FIRST_NVE_PS = 50000  # 50 ns
+# density 固定切片数（不再按盒子高度动态计算，避免多余计算）
+DENSITY_SL = 1500
+# 每轮密度只统计整条累计轨迹的“最后这段窗口”（ns）
+DENSITY_WINDOW_NS = 5
+DENSITY_WINDOW_PS = DENSITY_WINDOW_NS * 1000
 
 
 # ============================================================
@@ -670,16 +679,24 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
         run_command(mdrun_cmd, cwd=str(voltage_dir), env=gmx_env)
 
     # 5. 计算体相密度 (group 6)
-    box_z_total = params["box_z_total"]
-    sl = math.ceil(box_z_total / 0.01)
+    #    - 固定切片数 DENSITY_SL (不再按盒子高度动态计算)
+    #    - 方向固定 Z (-d Z)
+    #    - -s 明确指向当前轮的 tpr 文件 nve.tpr：续跑时旧 tpr 会先改名归档为
+    #      nve_loop{N}.tpr，并用 convert-tpr 重新生成 nve.tpr，故当前轮恒为该名
+    #    - -b 取整条累计轨迹的最后 DENSITY_WINDOW_NS ns：
+    #        累计总时长 = FIRST_NVE_PS + (loop-1)*EXTEND_PS
+    #        begin = 总时长 - 窗口 (首轮 50ns 时 begin=45000，每续跑10ns后移)
+    sl = DENSITY_SL
+    total_ps = FIRST_NVE_PS + (loop - 1) * EXTEND_PS
+    begin_ps = total_ps - DENSITY_WINDOW_PS
 
     nve_xtc = voltage_dir / NVE_XTC
     if not nve_xtc.is_file():
         fail(f"{voltage_dir} 缺少 {NVE_XTC}，无法计算密度")
 
     run_command(
-        [gmx, "density", "-f", NVE_XTC, "-s", "nve",
-         "-sl", str(sl), "-o", CAT_XVG],
+        [gmx, "density", "-f", NVE_XTC, "-s", NVE_TPR,
+         "-sl", str(sl), "-d", "Z", "-b", str(begin_ps), "-o", CAT_XVG],
         cwd=str(voltage_dir),
         stdin_text=f"{DENSITY_GROUP}\n",
         env=gmx_env,
