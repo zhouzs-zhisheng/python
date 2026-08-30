@@ -80,6 +80,9 @@ MATRIX_FILE = "allMatrixA.bin"
 DENSITY_GROUP = 6
 CHARGE_INTERVAL_STEPS = 5000
 CHARGE_CONVERGENCE_THRESHOLD = 0.005
+# 0V 收敛采用绝对判据：连续两电荷窗口平均值的绝对差 < 此值(e) 即收敛。
+# 因为 0V 的电荷均值≈0，相对判据分母→0 会失效。
+CHARGE_ABS_CONV_TOL = 0.5
 
 DEFAULT_MAX_LOOPS = 10
 
@@ -287,7 +290,8 @@ def derive_density_region(summary):
 def process_electrode_charge(charge_file, interval):
     """
     读取电极电荷数据文件，每 interval 行求一次平均。
-    文件格式：每行一个浮点数，# 开头跳过。
+    文件格式：每行两列为 (负极电荷, 正极电荷)，开头可有带 # 的注释行。
+    当前 0V 收敛只统计“负极”列，故取每行第 1 列；# 开头和空行跳过。
     """
     data = []
     with open(charge_file, "r") as f:
@@ -311,6 +315,28 @@ def process_electrode_charge(charge_file, interval):
             continue
         means.append(sum(chunk) / len(chunk))
     return means
+
+
+def _charge_windows_converged(avg_charges, is_zero_voltage):
+    """
+    判断连续两个电荷窗口的平均值是否收敛。
+    返回 (converged, delta)：
+      - 0V  ：delta = c_cur - c_prev (绝对差)，
+              |delta| < CHARGE_ABS_CONV_TOL (0.5) 视为收敛。
+      - 其他：delta = (c_cur - c_prev) / c_prev (相对差)，
+              |delta| < CHARGE_CONVERGENCE_THRESHOLD 视为收敛。
+    窗口不足或(非0V)分母为0时返回 (False, None)。
+    """
+    if len(avg_charges) < 2:
+        return False, None
+    c_prev, c_cur = avg_charges[-2], avg_charges[-1]
+    if is_zero_voltage:
+        delta = c_cur - c_prev
+        return abs(delta) < CHARGE_ABS_CONV_TOL, delta
+    if c_prev == 0:
+        return False, None
+    delta = (c_cur - c_prev) / c_prev
+    return abs(delta) < CHARGE_CONVERGENCE_THRESHOLD, delta
 
 
 def calc_average_density(xvg_path, z_low, z_high):
@@ -544,21 +570,29 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
     #    注意：首轮 / 文件不存在时跳过，mdrun 会首次生成电荷文件；
     #    只有续跑 (非首轮) 时缺少电荷文件才视为异常。
     charge_file = voltage_dir / CHARGE_FILE
-    pre_converged = False
     if charge_file.is_file():
         avg_charges = process_electrode_charge(
             charge_file, CHARGE_INTERVAL_STEPS
         )
-        if len(avg_charges) >= 2:
-            delta = (
-                (avg_charges[-1] - avg_charges[-2]) / avg_charges[-2]
-            )
-            print(
-                f"  [续跑前] 电荷窗口数={len(avg_charges)}, "
-                f"最近两窗口: {avg_charges[-2]:.4f} -> {avg_charges[-1]:.4f}, "
-                f"delta={delta*100:.4f}%"
-            )
-            if abs(delta) < CHARGE_CONVERGENCE_THRESHOLD:
+        is_zero_voltage = voltage_dir.name == ZERO_V
+        converged, delta = _charge_windows_converged(
+            avg_charges, is_zero_voltage
+        )
+        if delta is not None:
+            if is_zero_voltage:
+                print(
+                    f"  [续跑前] 0V 电荷窗口数={len(avg_charges)}, "
+                    f"最近两窗口: {avg_charges[-2]:.4f} -> "
+                    f"{avg_charges[-1]:.4f}, |Δcharge|={abs(delta):.4f} e "
+                    f"(阈<{CHARGE_ABS_CONV_TOL})"
+                )
+            else:
+                print(
+                    f"  [续跑前] 电荷窗口数={len(avg_charges)}, "
+                    f"最近两窗口: {avg_charges[-2]:.4f} -> "
+                    f"{avg_charges[-1]:.4f}, delta={delta*100:.4f}%"
+                )
+            if converged:
                 density = calc_average_density(
                     voltage_dir / DENSITY_XVG,
                     params["bulk_z_low"], params["bulk_z_high"]
@@ -714,30 +748,35 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
     avg_charges = process_electrode_charge(
         charge_file, CHARGE_INTERVAL_STEPS
     )
-    if len(avg_charges) >= 2:
-        delta = (
-            (avg_charges[-1] - avg_charges[-2]) / avg_charges[-2]
-        )
-        print(
-            f"  [续跑后] 电荷窗口数={len(avg_charges)}, "
-            f"delta={delta*100:.4f}%"
-        )
-    else:
-        delta = 1.0
-        warn("续跑后电荷窗口仍 <2，无法判定收敛")
+    is_zero_voltage = voltage_dir.name == ZERO_V
+    converged, delta = _charge_windows_converged(
+        avg_charges, is_zero_voltage
+    )
 
     # 8. 写日志
     append_density_log(log_file, loop, density)
 
     # 9. 判收敛
-    if abs(delta) < CHARGE_CONVERGENCE_THRESHOLD:
+    if delta is None:
+        warn("续跑后电荷窗口仍 <2，无法判定收敛，下轮继续")
+        return False
+    if is_zero_voltage:
+        print(f"  [续跑后] 0V 电荷窗口数={len(avg_charges)}, "
+              f"|Δcharge|={abs(delta):.4f} e (阈<{CHARGE_ABS_CONV_TOL})")
+    else:
+        print(f"  [续跑后] 电荷窗口数={len(avg_charges)}, "
+              f"delta={delta*100:.4f}%")
+    if converged:
         write_equilibrium_log(
             voltage_dir, loop, avg_charges[-1], density
         )
         return True
     else:
-        print(f"  {voltage_dir.name} 第 {loop} 轮未收敛 (delta="
-              f"{delta*100:.4f}%)，下轮继续")
+        if is_zero_voltage:
+            msg = f"|Δcharge|={abs(delta):.4f} e"
+        else:
+            msg = f"delta={delta*100:.4f}%"
+        print(f"  {voltage_dir.name} 第 {loop} 轮未收敛 ({msg})，下轮继续")
         return False
 
 
