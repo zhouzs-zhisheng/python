@@ -29,10 +29,18 @@ cpm_equilibrium_loop.py
     # 单电压点模式 (只跑指定电压点)
     python cpm_equilibrium_loop.py <system_root> --voltage 1V [--gmx GMX]
 
+    # 强制重新开始 (清空既有 nve.* / density.log，从首轮 50ns 重跑)
+    python cpm_equilibrium_loop.py <system_root> --mode restart [--voltage 2V]
+
+    # 指定续跑 (用 tpr 归档名 + density.log 双重判定已完成轮次，
+    #           读取轨迹总时长作密度窗口起点，并回填缺失的 density.log)
+    python cpm_equilibrium_loop.py <system_root> --mode continue [--voltage 2V]
+
     system_root : ACN 目录 (其下有 fine/, system_summary.json)
     --voltage   : 只跑指定电压点 (0V/1V/2V/3V/4V)，不进入其他电压点
     --gmx       : gmx 可执行文件路径，默认 gmx
     --max-loops : 每个电压点的最大循环轮次，默认 10
+    --mode      : auto=自动判定(默认) / restart=强制重新开始 / continue=指定续跑
 
 目录结构要求：
     qmof-xxx/
@@ -60,6 +68,7 @@ cpm_equilibrium_loop.py
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -85,6 +94,17 @@ CHARGE_CONVERGENCE_THRESHOLD = 0.005
 CHARGE_ABS_CONV_TOL = 0.5
 
 DEFAULT_MAX_LOOPS = 10
+
+# 运行模式开关
+#   auto      : 自动判定——优先用 tpr 归档名 + density.log 的磁盘事实推断轮次，
+#               据此决定续跑还是首轮 (推荐默认，可修复旧代码崩溃导致的误判)。
+#   restart   : 强制重新开始。清空本电压点已有 nve.*/nve_loop*/density.log 产物，
+#               从首轮 (grompp 50ns) 重新跑。
+#   continue  : 因特殊原因强制续跑。用 tpr 归档名 + density.log 双重判定已完成轮次，
+#               并读取 nve.xtc 实测总时长作为密度窗口起点，回填缺失的 density.log。
+MODE_AUTO = "auto"
+MODE_RESTART = "restart"
+MODE_CONTINUE = "continue"
 
 DENSITY_LOG = "density.log"
 EQUILIBRIUM_LOG = "new_equilibrium_result.log"
@@ -441,6 +461,187 @@ def append_density_log(log_file, loop, density):
         f.write(f"{loop:5d}    {density:10.4f}\n")
 
 
+def existing_loop_numbers(log_file):
+    """返回 density.log 里已记录的 loop 编号集合。"""
+    log_path = Path(log_file)
+    loops = set()
+    if not log_path.is_file():
+        return loops
+    with open(log_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+            try:
+                loops.add(int(parts[0]))
+            except ValueError:
+                continue
+    return loops
+
+
+def count_archived_loops(voltage_dir):
+    """
+    从 nve_loop{N}.tpr 归档文件名反推整条模拟已经完成到第几轮 (磁盘事实)。
+
+    规则：首轮 (round1) 结束时 nve.tpr 常驻；第 2 轮起把上一轮 tpr 归档为
+    nve_loop1.tpr、nve_loop2.tpr ……。因此：
+      - 存在 nve.tpr   -> 至少完成 1 轮
+      - 归档最大序号 N -> 又额外完成 N 轮
+    已完成轮数 = max_arch + (nve.tpr 存在 ? 1 : 0)。
+
+    该值与 density.log (记录流口径) 互为印证，用于双重判定。当旧代码崩溃导致
+    density.log 缺失但仍留有 nve.tpr 时，此函数能据磁盘事实判断「应续跑而非首轮」。
+    """
+    voltage_dir = Path(voltage_dir)
+    max_arch = 0
+    for p in voltage_dir.glob("nve_loop*.tpr"):
+        try:
+            n = int(p.stem[len("nve_loop"):])
+        except ValueError:
+            continue
+        max_arch = max(max_arch, n)
+    if max_arch == 0 and not (voltage_dir / NVE_TPR).is_file():
+        return 0
+    return max_arch + 1 if (voltage_dir / NVE_TPR).is_file() else max_arch
+
+
+def resolve_loop_state(voltage_dir, log_file, mode):
+    """
+    双重判定「已完成轮次 completed / 本轮 loop / 是否首轮」。
+
+    - restart : 强制 completed=0，从首轮开始。
+    - auto/continue : completed = max(磁盘事实 arch, 记录流 log)，
+      ——取较高者，避免把已跑过的体系（如旧代码崩溃留下 nve.tpr 但无 density.log）
+      误判为首轮而重新 grompp 覆盖掉既有轨迹。
+    返回 (completed, next_loop, is_first)。
+    """
+    voltage_dir = Path(voltage_dir)
+    arch_completed = count_archived_loops(voltage_dir)
+    log_next, _ = read_last_loop(log_file)
+    log_completed = max(log_next - 1, 0)  # 下一轮-1
+
+    if mode == MODE_RESTART:
+        completed = 0
+    else:
+        completed = max(arch_completed, log_completed)
+
+    return completed, completed + 1, completed == 0
+
+
+def _run_capture(args, cwd, env, stdin_text=None):
+    """后台静默运行并捕获全部输出 (不回显)，用于读取 gmx check 等返回信息。失败返回 None。"""
+    try:
+        proc = subprocess.run(
+            args, cwd=cwd, input=stdin_text,
+            capture_output=True, text=True, env=env,
+        )
+    except FileNotFoundError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return (proc.stdout or "") + (proc.stderr or "")
+
+
+def _last_time_ps(output):
+    """从 gmx check 输出解析最后一个 'time <X> ps' 作为轨迹最后时刻 (ps)。"""
+    if not output:
+        return None
+    matches = re.findall(
+        r"[Tt]ime\s+([0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)\s+ps", output
+    )
+    if not matches:
+        return None
+    try:
+        return float(matches[-1])
+    except ValueError:
+        return None
+
+
+def read_traj_total_time(voltage_dir, gmx, gmx_env):
+    """
+    读取累计轨迹 nve.xtc 的实测总时长 (ps)。
+
+    用 `gmx check -f nve.xtc` 解析 "Last frame ... time <X> ps"。
+    轨迹为续跑累积 (+append)，因此这是判断"这次模拟真正开始了多久"的最本质依据。
+    读取失败返回 None，调用方回退到按轮次外推的时间口径。
+    """
+    xtc = Path(voltage_dir) / NVE_XTC
+    if not xtc.is_file():
+        return None
+    out = _run_capture([gmx, "check", "-f", NVE_XTC],
+                       cwd=str(voltage_dir), env=gmx_env)
+    return _last_time_ps(out)
+
+
+def reset_round(voltage_dir):
+    """
+    restart 模式下清空本电压点既有模拟产物，从首轮重新开始。
+    保留 start.gro / index.ndx / topol.top / 矩阵 等输入准备产物。
+    """
+    voltage_dir = Path(voltage_dir)
+    patterns = (
+        "nve.gro", "nve.xtc", "nve.cpt", "nve.tpr", "nve.edr", "nve.log",
+        "nve_loop*.tpr", DENSITY_LOG, DENSITY_XVG,
+    )
+    for pat in patterns:
+        for p in voltage_dir.glob(pat):
+            p.unlink()
+            print(f"  [restart] 移除 {p.name}")
+    elog = voltage_dir / EQUILIBRIUM_LOG
+    if elog.is_file():
+        elog.unlink()
+        print(f"  [restart] 移除 {elog.name}")
+
+
+def backfill_density_log(voltage_dir, up_to_loop, gmx, gmx_env, params):
+    """
+    回填 density.log 中缺失的轮次行 (1..up_to_loop 中未记录的 loop)。
+
+    对缺失轮次 k：用 gmx density -b <begin> -e <begin+窗口> 限定窗口补算，
+    再追加写入 density.log，保证 loop 编号连续，read_last_loop 下次能读到正确
+    的下一轮编号（否则崩溃后日志缺行会让下一轮误判为首轮）。
+    """
+    voltage_dir = Path(voltage_dir)
+    if up_to_loop < 1:
+        return
+    log_file = voltage_dir / DENSITY_LOG
+    done = existing_loop_numbers(log_file)
+    missing = [k for k in range(1, up_to_loop + 1) if k not in done]
+    if not missing:
+        return
+
+    xtc = voltage_dir / NVE_XTC
+    if not xtc.is_file():
+        warn(
+            f"density.log 缺 {len(missing)} 行，但缺少 {NVE_XTC}，"
+            f"无法回填，跳过"
+        )
+        return
+
+    for k in missing:
+        begin = FIRST_NVE_PS + (k - 1) * EXTEND_PS - DENSITY_WINDOW_PS
+        end = begin + DENSITY_WINDOW_PS
+        print(f"  [回填] 补算密度 loop={k}  (window {begin:.0f}~{end:.0f} ps)")
+        run_command(
+            [gmx, "density", "-f", NVE_XTC, "-s", NVE_TPR, "-n", INDEX_NDX,
+             "-sl", str(DENSITY_SL), "-d", "Z",
+             "-b", str(begin), "-e", str(end),
+             "-o", DENSITY_XVG],
+            cwd=str(voltage_dir),
+            stdin_text=f"{DENSITY_GROUP}\n",
+            env=gmx_env,
+        )
+        density = calc_average_density(
+            voltage_dir / DENSITY_XVG,
+            params["bulk_z_low"], params["bulk_z_high"]
+        )
+        append_density_log(log_file, k, density)
+        print(f"  [回填] loop={k}  bulk_density={density:.4f}")
+
+
 def write_equilibrium_log(voltage_dir, loop, avg_charge, density):
     log_path = Path(voltage_dir) / EQUILIBRIUM_LOG
     with open(log_path, "w") as f:
@@ -584,10 +785,16 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
     else:
         print("  mdrun 模式: 纯 CPU")
 
-    # 1. 读取当前轮次
+    # 1. 双重判定当前轮次 (或按 restart 清空从首轮开始)
     log_file = voltage_dir / DENSITY_LOG
-    loop, is_first = read_last_loop(log_file)
-    print(f"  当前轮次: loop={loop}, is_first={is_first}")
+    completed, loop, is_first = resolve_loop_state(
+        voltage_dir, log_file, args_mode
+    )
+    if args_mode == MODE_RESTART:
+        reset_round(voltage_dir)
+        completed, loop, is_first = 0, 1, True
+    print(f"  运行模式   : {args_mode}")
+    print(f"  已完成轮次 : {completed}, 本轮为 loop={loop}, is_first={is_first}")
 
     # 2. 续跑前先检查是否已收敛
     #    注意：首轮 / 文件不存在时跳过，mdrun 会首次生成电荷文件；
@@ -751,6 +958,19 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
     #        begin = 总时长 - 窗口 (首轮 50ns 时 begin=45000，每续跑10ns后移)
     sl = DENSITY_SL
     total_ps = FIRST_NVE_PS + (loop - 1) * EXTEND_PS
+
+    # continue 模式下，优先读轨迹实测总时长作为密度窗口起点——
+    # 它反映"这次模拟真正累计跑了多久"，比按轮次外推更贴近实际
+    # (例如上一轮中途崩溃只跑了一部分时)。读取失败则回退到外推值。
+    traj_total = None
+    if args_mode == MODE_CONTINUE:
+        traj_total = read_traj_total_time(voltage_dir, gmx, gmx_env)
+        if traj_total is not None:
+            print(f"  [continue] 轨迹实测总时长 = {traj_total:.1f} ps"
+                  f" (按轮次外推 = {total_ps:.0f} ps)")
+            total_ps = traj_total
+        else:
+            warn("读取轨迹实测总时长失败，回退到按轮次外推的时间口径")
     begin_ps = total_ps - DENSITY_WINDOW_PS
 
     nve_xtc = voltage_dir / NVE_XTC
@@ -782,8 +1002,9 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
         avg_charges, is_zero_voltage
     )
 
-    # 8. 写日志
+    # 8. 写日志 (当前轮) + 回填缺失的旧轮次
     append_density_log(log_file, loop, density)
+    backfill_density_log(voltage_dir, loop - 1, gmx, gmx_env, params)
 
     # 9. 判收敛
     if delta is None:
@@ -884,6 +1105,7 @@ def run_single_voltage(system_root, voltage_name, gmx, params,
 
 # 全局变量 (由 main 设置，供 run_single_voltage 使用)
 args_max_loops = DEFAULT_MAX_LOOPS
+args_mode = MODE_AUTO
 
 
 # ============================================================
@@ -892,6 +1114,7 @@ args_max_loops = DEFAULT_MAX_LOOPS
 
 def main():
     global args_max_loops
+    global args_mode
 
     parser = argparse.ArgumentParser(
         description="CPM 体系平衡检测循环 (0V 优先 + 多电压点 / 单电压点)"
@@ -924,9 +1147,18 @@ def main():
         help="启用 GPU 加速 mdrun：-nb gpu -pme gpu -pmefft gpu "
              "(默认关闭，纯 CPU 运行)",
     )
+    parser.add_argument(
+        "--mode",
+        choices=[MODE_AUTO, MODE_RESTART, MODE_CONTINUE],
+        default=MODE_AUTO,
+        help="运行模式：auto=自动判定(默认)，restart=强制重新开始，"
+             "continue=指定续跑(用 tpr 归档+density.log 双重判定，"
+             "读取轨迹总时长并回填 density.log)",
+    )
     args = parser.parse_args()
 
     args_max_loops = args.max_loops
+    args_mode = args.mode
 
     # 一次性构造 gmx 子进程环境 (含 LD_LIBRARY_PATH 注入)
     gmx_env = build_gmx_env(args.gmx)
@@ -973,6 +1205,7 @@ def main():
     else:
         print("GMX lib path : (未注入，使用进程继承环境)")
     print(f"Max loops    : {args.max_loops}")
+    print(f"Run mode     : {args.mode}")
     if args.voltage:
         print(f"Mode         : 单电压点 ({args.voltage})")
     else:
