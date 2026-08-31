@@ -183,12 +183,18 @@ def build_gmx_env(gmx_path):
     return env
 
 
-def run_command(args, cwd=None, stdin_text=None, env=None):
+def run_command(args, cwd=None, stdin_text=None, env=None,
+                tolerate_artifacts=None):
     """
     运行外部命令。
 
     env=None  时：subprocess 自动继承当前 Python 进程环境 (最常见情况)。
     env=<dict>时：直接使用该字典作为子进程完整环境。
+
+    tolerate_artifacts: 可选路径列表 (相对 cwd 或绝对路径)。当命令返回非零时，
+        若这些产物文件全部已生成(存在且非空)，则视为“运行已完成、仅是收尾
+        报错”(如 GROMACS 的 CUDA teardown)，忽略返回码放行，而不是硬失败；
+        若任一产物缺失则仍按失败处理。
 
     用法：所有 gmx 调用都应传入 build_gmx_env() 返回的 env，
          确保 LD_LIBRARY_PATH 被正确注入以便找到 libomp.so 等。
@@ -226,6 +232,23 @@ def run_command(args, cwd=None, stdin_text=None, env=None):
 
     proc.wait()
     if proc.returncode != 0:
+        # 软失败：若指定了「完成后产物清单」且全部已生成，说明模拟本体已完成，
+        # 仅是非零收尾报错(如 GROMACS CUDA teardown 的 cudaFreeHost)，放行继续。
+        if tolerate_artifacts:
+            base = Path(cwd) if cwd else Path.cwd()
+            all_paths = [
+                (name if isinstance(name, Path) and name.is_absolute()
+                 else base / name)
+                for name in tolerate_artifacts
+            ]
+            present = [p for p in all_paths
+                       if p.is_file() and p.stat().st_size > 0]
+            if len(present) == len(all_paths):
+                warn(
+                    "命令返回码非零，但指定产物均已生成，视为完成后的收尾"
+                    "报错（如 CUDA teardown），放行继续"
+                )
+                return proc
         detail = "".join(buffered)[-4000:]
         fail(
             f"命令执行失败 (返回码 {proc.returncode})：\n"
@@ -663,12 +686,15 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
         mdrun_cmd = [
             gmx, "mdrun", "-deffnm", "nve",
             "-ntmpi", "1", "-ntomp", "32",
-            "-tunepme", "no", "-v", "-pin", "on", "-nstlist", "20",
+            "-tunepme", "no", "-v", "-pin", "on",
         ]
         if use_gpu:
             mdrun_cmd += ["-nb", "gpu", "-pme", "gpu", "-pmefft", "gpu"]
         print("  首轮模式 (无 cpt)")
-        run_command(mdrun_cmd, cwd=str(voltage_dir), env=gmx_env)
+        run_command(
+            mdrun_cmd, cwd=str(voltage_dir), env=gmx_env,
+            tolerate_artifacts=[voltage_dir / NVE_GRO, voltage_dir / NVE_XTC],
+        )
 
     else:
         # ---- 续跑: convert-tpr + mdrun -cpi -append ----
@@ -704,13 +730,16 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
         mdrun_cmd = [
             gmx, "mdrun", "-deffnm", "nve",
             "-ntmpi", "1", "-ntomp", "32",
-            "-tunepme", "no", "-v", "-pin", "on", "-nstlist", "20",
+            "-tunepme", "no", "-v", "-pin", "on",
             "-cpi", NVE_CPT, "-append",
         ]
         if use_gpu:
             mdrun_cmd += ["-nb", "gpu", "-pme", "gpu", "-pmefft", "gpu"]
         print("  续跑模式 (-cpi nve.cpt -append)")
-        run_command(mdrun_cmd, cwd=str(voltage_dir), env=gmx_env)
+        run_command(
+            mdrun_cmd, cwd=str(voltage_dir), env=gmx_env,
+            tolerate_artifacts=[voltage_dir / NVE_GRO, voltage_dir / NVE_XTC],
+        )
 
     # 5. 计算体相密度 (group 6)
     #    - 固定切片数 DENSITY_SL (不再按盒子高度动态计算)
