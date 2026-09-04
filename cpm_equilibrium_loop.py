@@ -15,7 +15,7 @@ cpm_equilibrium_loop.py
     Phase 3: 循环跑 1V/2V/3V/4V 直到全部电荷收敛
 
 续跑机制：
-    - 首轮: grompp 生成 nve.tpr (30ns)，mdrun -deffnm nve
+    - 首轮: grompp 生成 nve.tpr (50ns)，mdrun -deffnm nve
     - 续跑: mv nve.tpr → nve_loop{N-1}.tpr，
             convert-tpr -extend 10000 (延长 10ns) 生成新 nve.tpr，
             mdrun -deffnm nve -cpi nve.cpt -append (轨迹追加到原 xtc)
@@ -29,7 +29,7 @@ cpm_equilibrium_loop.py
     # 单电压点模式 (只跑指定电压点)
     python cpm_equilibrium_loop.py <system_root> --voltage 1V [--gmx GMX]
 
-    # 强制重新开始 (清空既有 nve.* / density.log，从首轮 30ns 重跑)
+    # 强制重新开始 (清空既有 nve.* / density.log，从首轮 50ns 重跑)
     python cpm_equilibrium_loop.py <system_root> --mode restart [--voltage 2V]
 
     # 指定续跑 (用 tpr 归档名 + density.log 双重判定已完成轮次，
@@ -51,7 +51,7 @@ cpm_equilibrium_loop.py
     │   │   └── topol.top         # 拓扑 (所有电压点共用)
     │   ├── system_summary.json
     │   ├── grompp.mdp            # 10ns NVE 参数
-    │   ├── grompp_30ns.mdp       # 30ns NVE 参数 (首轮)
+    │   ├── grompp_50ns.mdp       # 50ns NVE 参数 (首轮)
     │   ├── 0V/                   # 工作目录 (脚本自动创建)
     │   ├── 1V/
     │   ├── 2V/
@@ -67,8 +67,9 @@ cpm_equilibrium_loop.py
 
 # ============================================================
 # 更新记录
-#   2026-08-31 : 首轮 NVE 时长由 50ns 改为 30ns，使用 grompp_30ns.mdp
-#                (FIRST_NVE_PS=30000)；density 窗口 begin 随之调整。
+#   2026-08-31 : 首轮 NVE 时长改回 50ns，使用 grompp_50ns.mdp
+#                (FIRST_NVE_PS=50000)；density 窗口 begin 随之调整。
+#                注：此前临时改为 30ns 已作废。
 # ============================================================
 
 import argparse
@@ -105,7 +106,7 @@ DEFAULT_MAX_LOOPS = 10
 #   auto      : 自动判定——优先用 tpr 归档名 + density.log 的磁盘事实推断轮次，
 #               据此决定续跑还是首轮 (推荐默认，可修复旧代码崩溃导致的误判)。
 #   restart   : 强制重新开始。清空本电压点已有 nve.*/nve_loop*/density.log 产物，
-#               从首轮 (grompp 30ns) 重新跑。
+#               从首轮 (grompp 50ns) 重新跑。
 #   continue  : 因特殊原因强制续跑。用 tpr 归档名 + density.log 双重判定已完成轮次，
 #               并读取 nve.xtc 实测总时长作为密度窗口起点，回填缺失的 density.log。
 MODE_AUTO = "auto"
@@ -125,7 +126,7 @@ NVE_EDR = "nve.edr"
 NVE_LOG = "nve.log"
 
 GROMPP_MDP = "grompp.mdp"
-GROMPP_30NS_MDP = "grompp_30ns.mdp"
+GROMPP_50NS_MDP = "grompp_50ns.mdp"
 INDEX_NDX = "index.ndx"
 TOPOL_TOP = "topol.top"
 DENSITY_XVG = "density.xvg"
@@ -135,9 +136,9 @@ SYSTEM_SUMMARY = "system_summary.json"
 EXTEND_PS = 10000  # 10 ns = 10000 ps
 
 # ---------- 密度统计参数 ----------
-# 首轮 NVE 时长 (ps)：默认 30 ns。若回退到 grompp.mdp (10ns) 使用，
+# 首轮 NVE 时长 (ps)：默认 50 ns。若回退到 grompp.mdp (10ns) 使用，
 # 请相应改为 10000。
-FIRST_NVE_PS = 30000  # 30 ns
+FIRST_NVE_PS = 50000  # 50 ns
 # density 固定切片数（不再按盒子高度动态计算，避免多余计算）
 DENSITY_SL = 1500
 # 每轮密度只统计整条累计轨迹的“最后这段窗口”（ns）
@@ -772,7 +773,7 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
 
     续跑逻辑：
         Loop 1 (首次):
-            grompp -c start.gro -o nve.tpr (30ns)
+            grompp -c start.gro -o nve.tpr (50ns)
             mdrun -deffnm nve (无 cpt)
         Loop 2+ (续跑):
             mv nve.tpr → nve_loop{loop-1}.tpr
@@ -855,7 +856,7 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
 
     if is_first:
         # ---- 首轮: grompp + mdrun ----
-        print(f"\n  --- 首轮 NVE (30ns) ---")
+        print(f"\n  --- 首轮 NVE (50ns) ---")
 
         if not start_gro.is_file():
             fail(
@@ -863,31 +864,31 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
                 f"无法启动首轮 NVE"
             )
 
-        # 选择 mdp (优先 30ns，回退 10ns)
-        mdp_30ns = Path(shared_files_dir) / GROMPP_30NS_MDP
+        # 选择 mdp (优先 50ns，回退 10ns)
+        mdp_50ns = Path(shared_files_dir) / GROMPP_50NS_MDP
         mdp_10ns = Path(shared_files_dir) / GROMPP_MDP
 
-        if mdp_30ns.is_file():
-            use_mdp = mdp_30ns
-            print(f"  首轮使用 30ns mdp：{use_mdp}")
+        if mdp_50ns.is_file():
+            use_mdp = mdp_50ns
+            print(f"  首轮使用 50ns mdp：{use_mdp}")
         elif mdp_10ns.is_file():
             use_mdp = mdp_10ns
-            warn(f"30ns mdp 不存在，首轮使用 10ns mdp：{use_mdp}")
+            warn(f"50ns mdp 不存在，首轮使用 10ns mdp：{use_mdp}")
         else:
             fail(
-                f"找不到 mdp 文件：{mdp_10ns} 或 {mdp_30ns}\n"
-                f"请在 {shared_files_dir} 下准备 {GROMPP_MDP} 和 {GROMPP_30NS_MDP}"
+                f"找不到 mdp 文件：{mdp_10ns} 或 {mdp_50ns}\n"
+                f"请在 {shared_files_dir} 下准备 {GROMPP_MDP} 和 {GROMPP_50NS_MDP}"
             )
 
         # 保持原文件名复制到工作目录 (不重命名为 grompp.mdp)。
-        # 这样 grompp 命令行的 -f 参数直接反映是 30ns 还是 10ns，
+        # 这样 grompp 命令行的 -f 参数直接反映是 50ns 还是 10ns，
         # 避免用户从日志看到 -f grompp.mdp 误以为用的是 10ns。
         mdp_basename = use_mdp.name
         dst_mdp = voltage_dir / mdp_basename
         shutil.copy(str(use_mdp), str(dst_mdp))
         print(f"  复制 mdp -> {dst_mdp}")
 
-        # grompp (-f 使用与源一致的文件名，保留 _30ns 后缀语义)
+        # grompp (-f 使用与源一致的文件名，保留 _50ns 后缀语义)
         run_command(
             [gmx, "grompp", "-f", mdp_basename, "-c", START_GRO,
              "-o", NVE_TPR, "-n", INDEX_NDX, "-maxwarn", "6"],
@@ -961,7 +962,7 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
     #      nve_loop{N}.tpr，并用 convert-tpr 重新生成 nve.tpr，故当前轮恒为该名
     #    - -b 取整条累计轨迹的最后 DENSITY_WINDOW_NS ns：
     #        累计总时长 = FIRST_NVE_PS + (loop-1)*EXTEND_PS
-    #        begin = 总时长 - 窗口 (首轮 30ns 时 begin=25000，每续跑10ns后移)
+    #        begin = 总时长 - 窗口 (首轮 50ns 时 begin=45000，每续跑10ns后移)
     sl = DENSITY_SL
     total_ps = FIRST_NVE_PS + (loop - 1) * EXTEND_PS
 
@@ -1263,11 +1264,11 @@ def main():
 
     # 3. 检查共用 mdp 文件
     mdp_10ns = system_root / GROMPP_MDP
-    mdp_30ns = system_root / GROMPP_30NS_MDP
+    mdp_50ns = system_root / GROMPP_50NS_MDP
     if not mdp_10ns.is_file():
         fail(f"共用 mdp 不存在：{mdp_10ns}")
-    if not mdp_30ns.is_file():
-        warn(f"30ns mdp 不存在：{mdp_30ns}，首轮将使用 10ns mdp")
+    if not mdp_50ns.is_file():
+        warn(f"50ns mdp 不存在：{mdp_50ns}，首轮将使用 10ns mdp")
 
     # ============================================================
     # 单电压点模式
