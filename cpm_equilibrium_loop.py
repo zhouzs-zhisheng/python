@@ -41,6 +41,11 @@ cpm_equilibrium_loop.py
     --gmx       : gmx 可执行文件路径，默认 gmx
     --max-loops : 每个电压点的最大循环轮次，默认 10
     --mode      : auto=自动判定(默认) / restart=强制重新开始 / continue=指定续跑
+    --target-time-ns: 目标模拟时长 (ns)。指定后关闭电荷平衡判定，改为每跑完整
+               轮次后判断累计轨迹总时长是否达到目标，达到即标记完成。
+               建议取整轮次时长：50=1轮, 60=2轮, 70=3轮 ...。
+               默认不指定 = 使用电荷收敛判定。
+               (完成标记为 time_target_reached.log，独立于收敛标记)
 
 目录结构要求：
     qmof-xxx/
@@ -70,6 +75,11 @@ cpm_equilibrium_loop.py
 #   2026-08-31 : 首轮 NVE 时长改回 50ns，使用 grompp_50ns.mdp
 #                (FIRST_NVE_PS=50000)；density 窗口 begin 随之调整。
 #                注：此前临时改为 30ns 已作废。
+#   2026-08-31 : 新增 --target-time-ns 时间判定模式。指定后关闭电荷收敛判据，
+#                改为每跑完整轮次后判断累计轨迹总时长是否达到目标，达到即标记
+#                完成 (写 time_target_reached.log，独立于 new_equilibrium_result.log)。
+#                判定依据：整轮次网格 (50/60/70...ns) + 读完整轮才判断，
+#                避免中断产生的零头时长被误判为完成。
 # ============================================================
 
 import argparse
@@ -115,6 +125,8 @@ MODE_CONTINUE = "continue"
 
 DENSITY_LOG = "density.log"
 EQUILIBRIUM_LOG = "new_equilibrium_result.log"
+# 时间判定模式下，"达到目标时长"后写入的完成标记 (区别于电荷收敛标记)
+TIME_TARGET_LOG = "time_target_reached.log"
 
 # NVE 相关文件名 (从 NVT 改为 NVE)
 START_GRO = "start.gro"
@@ -601,6 +613,10 @@ def reset_round(voltage_dir):
     if elog.is_file():
         elog.unlink()
         print(f"  [restart] 移除 {elog.name}")
+    tlog = voltage_dir / TIME_TARGET_LOG
+    if tlog.is_file():
+        tlog.unlink()
+        print(f"  [restart] 移除 {tlog.name}")
 
 
 def backfill_density_log(voltage_dir, up_to_loop, gmx, gmx_env, params):
@@ -663,6 +679,61 @@ def write_equilibrium_log(voltage_dir, loop, avg_charge, density):
 def is_voltage_converged(voltage_dir):
     """检查电压点是否已收敛 (有 new_equilibrium_result.log)。"""
     return (Path(voltage_dir) / EQUILIBRIUM_LOG).is_file()
+
+
+def is_time_target_reached(voltage_dir):
+    """检查电压点是否已用时间判定达到目标时长 (有 time_target_reached.log)。"""
+    return (Path(voltage_dir) / TIME_TARGET_LOG).is_file()
+
+
+def read_marker_field(marker_path, key):
+    """从标记文件里读取 `key=value` 字段；取不到返回 "?"。"""
+    marker_path = Path(marker_path)
+    if not marker_path.is_file():
+        return "?"
+    try:
+        text = marker_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return "?"
+    for line in text.splitlines():
+        for part in line.split():
+            if part.startswith(key + "="):
+                return part.split("=", 1)[1]
+    return "?"
+
+
+def voltage_is_done(voltage_dir, time_mode):
+    """
+    该电压点是否已达到本轮"完成"目标：
+      - 时间判定模式：只看 time_target_reached.log，忽略电荷收敛标记
+        (因为指定时长时是"不管是否平衡，只看时间")
+      - 普通模式    ：只看 new_equilibrium_result.log
+    """
+    if time_mode:
+        return is_time_target_reached(voltage_dir)
+    return is_voltage_converged(voltage_dir)
+
+
+def is_complete_round_time(total_ps, tol_ps=1.0):
+    """
+    判断轨迹总时长是否落在"整轮次"网格上：
+    轮次时长 = FIRST_NVE_PS + k*EXTEND_PS (k=0,1,2,...)，即 50/60/70... ns。
+    仅在整轮次边界才允许按时间判"已完成"，避免中途中断的零头时长 (如 55ns)
+    被误判为完成——这种情况仍会先按正常续跑补完一整轮。
+    """
+    if total_ps < 0:
+        return False
+    rem = (total_ps - FIRST_NVE_PS) % EXTEND_PS
+    return rem <= tol_ps or (EXTEND_PS - rem) <= tol_ps
+
+
+def write_time_log(voltage_dir, loop, total_ps):
+    """时间判定模式达到目标时长后写入完成标记。"""
+    log_path = Path(voltage_dir) / TIME_TARGET_LOG
+    with open(log_path, "w") as f:
+        f.write("reached target time\n")
+        f.write(f"loop={loop}  total_time_ns={total_ps/1000:.3f}\n")
+    print(f"  -> {Path(voltage_dir).name} 达到目标时长，记录已写入 {log_path}")
 
 
 # ============================================================
@@ -803,11 +874,37 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
     print(f"  运行模式   : {args_mode}")
     print(f"  已完成轮次 : {completed}, 本轮为 loop={loop}, is_first={is_first}")
 
-    # 2. 续跑前先检查是否已收敛
-    #    注意：首轮 / 文件不存在时跳过，mdrun 会首次生成电荷文件；
-    #    只有续跑 (非首轮) 时缺少电荷文件才视为异常。
+    # 时间判定模式：指定了 --target-time-ns 则关闭电荷收敛判据，改用目标时长。
+    target_ps = (args_target_time_ns * 1000.0
+                 if args_target_time_ns is not None else None)
+    is_time_mode = target_ps is not None
+    if is_time_mode:
+        print(f"  [time] 判定依据: 累计轨迹总时长 >= {target_ps/1000:.1f} ns "
+              f"(关闭电荷收敛判据)")
+
+    # 2. 续跑前先检查是否已达本轮"完成"条件
+    #    时间判定模式 : 关闭电荷收敛判据，改为按目标时长判断；
+    #    普通模式     : 检查电荷是否已收敛 (逻辑保持不变)。
     charge_file = voltage_dir / CHARGE_FILE
-    if charge_file.is_file():
+    if is_time_mode:
+        # 已达目标时长且停在整轮次边界 -> 直接标记完成返回，不重复跑。
+        # 零头时长 (非整轮次) -> 不判完成，照常进入本轮 mdrun，跑满一整轮后再看。
+        traj_total = read_traj_total_time(voltage_dir, gmx, gmx_env)
+        if traj_total is None:
+            print(f"  [time] 读不到轨迹总时长 (可能尚未跑过本轮)，进入首轮/本轮")
+        elif is_complete_round_time(traj_total):
+            if traj_total >= target_ps:
+                print(f"  [time] 轨迹已累计 {traj_total/1000:.1f} ns，"
+                      f"达到目标 {target_ps/1000:.1f} ns，标记完成")
+                backfill_density_log(voltage_dir, loop - 1, gmx, gmx_env, params)
+                write_time_log(voltage_dir, loop, traj_total)
+                return True
+            print(f"  [time] 当前 {traj_total/1000:.1f} ns < 目标 "
+                  f"{target_ps/1000:.1f} ns，继续")
+        else:
+            print(f"  [time] 当前 {traj_total/1000:.1f} ns 不在整轮次边界，"
+                  f"先跑完本轮再判断")
+    elif charge_file.is_file():
         avg_charges = process_electrode_charge(
             charge_file, CHARGE_INTERVAL_STEPS
         )
@@ -966,14 +1063,15 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
     sl = DENSITY_SL
     total_ps = FIRST_NVE_PS + (loop - 1) * EXTEND_PS
 
-    # continue 模式下，优先读轨迹实测总时长作为密度窗口起点——
+    # continue / 时间判定 模式下，优先读轨迹实测总时长作为密度窗口起点——
     # 它反映"这次模拟真正累计跑了多久"，比按轮次外推更贴近实际
     # (例如上一轮中途崩溃只跑了一部分时)。读取失败则回退到外推值。
     traj_total = None
-    if args_mode == MODE_CONTINUE:
+    if args_mode == MODE_CONTINUE or is_time_mode:
         traj_total = read_traj_total_time(voltage_dir, gmx, gmx_env)
         if traj_total is not None:
-            print(f"  [continue] 轨迹实测总时长 = {traj_total:.1f} ps"
+            print(f"  [{args_mode if is_time_mode else 'continue'}] "
+                  f"轨迹实测总时长 = {traj_total:.1f} ps"
                   f" (按轮次外推 = {total_ps:.0f} ps)")
             total_ps = traj_total
         else:
@@ -1000,7 +1098,33 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
     print(f"  体相密度 (z={params['bulk_z_low']:.2f}~"
           f"{params['bulk_z_high']:.2f} nm) = {density:.4f}")
 
-    # 7. 重新读电荷，计算 delta
+    # 7. 写日志 (当前轮) + 回填缺失的旧轮次
+    append_density_log(log_file, loop, density)
+    backfill_density_log(voltage_dir, loop - 1, gmx, gmx_env, params)
+
+    # 8. 判"本轮完成"：
+    #    时间判定模式 -> 按目标时长 (跳过电荷收敛判据)
+    #    普通模式     -> 按电荷收敛判据
+    if is_time_mode:
+        traj_total = read_traj_total_time(voltage_dir, gmx, gmx_env)
+        if traj_total is None:
+            warn("[time] 本轮后无法读取轨迹总时长，继续下轮")
+            return False
+        print(f"  [time] 本轮后轨迹累计 {traj_total/1000:.1f} ns "
+              f"(目标 {target_ps/1000:.1f} ns)")
+        # 只有落在整轮次边界且时长达标才算完成；非整轮次(零头时长)一律不判完成，
+        # 照常进入下一轮跑满整轮，与"续跑前"的拦截逻辑保持一致。
+        if not is_complete_round_time(traj_total):
+            print(f"  [time] 轨迹 {traj_total/1000:.1f} ns 不在整轮次边界，"
+                  f"不判完成，下轮先补满整轮再判断")
+            return False
+        if traj_total >= target_ps:
+            write_time_log(voltage_dir, loop, traj_total)
+            return True
+        print(f"  [time] 尚未达到目标时长，下轮继续")
+        return False
+
+    # ---- 普通模式: 电荷收敛判据 ----
     avg_charges = process_electrode_charge(
         charge_file, CHARGE_INTERVAL_STEPS
     )
@@ -1009,11 +1133,6 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
         avg_charges, is_zero_voltage
     )
 
-    # 8. 写日志 (当前轮) + 回填缺失的旧轮次
-    append_density_log(log_file, loop, density)
-    backfill_density_log(voltage_dir, loop - 1, gmx, gmx_env, params)
-
-    # 9. 判收敛
     if delta is None:
         warn("续跑后电荷窗口仍 <2，无法判定收敛，下轮继续")
         return False
@@ -1052,10 +1171,14 @@ def run_single_voltage(system_root, voltage_name, gmx, params,
     print(f"单电压点模式：{voltage_name}")
     print(f"{'=' * 72}")
 
-    # 检查是否已收敛
-    if is_voltage_converged(vdir):
-        print(f"{voltage_name} 已收敛 (存在 {EQUILIBRIUM_LOG})")
-        print(f"如需重跑，请删除 {vdir / EQUILIBRIUM_LOG}")
+    time_mode = args_target_time_ns is not None
+
+    # 检查本电压点是否已完成 (收敛 或 达到目标时长)
+    if voltage_is_done(vdir, time_mode):
+        marker = vdir / (TIME_TARGET_LOG if is_time_target_reached(vdir)
+                         else EQUILIBRIUM_LOG)
+        print(f"{voltage_name} 已完成 (存在 {marker.name})")
+        print(f"如需重跑，请删除 {marker}")
         return
 
     # 准备输入结构
@@ -1093,17 +1216,19 @@ def run_single_voltage(system_root, voltage_name, gmx, params,
         if converged:
             break
     else:
+        done_word = "达到目标时长" if time_mode else "收敛"
         warn(
-            f"{voltage_name} 在 {args_max_loops} 轮后仍未收敛，"
+            f"{voltage_name} 在 {args_max_loops} 轮后仍未{done_word}，"
             f"请人工检查 {vdir}"
         )
 
     # 写单点汇总
-    if is_voltage_converged(vdir):
+    if voltage_is_done(vdir, time_mode):
         summary_path = system_root / EQUILIBRIUM_LOG
-        elog = vdir / EQUILIBRIUM_LOG
-        if elog.is_file():
-            content = elog.read_text(encoding="utf-8")
+        marker = vdir / (TIME_TARGET_LOG if is_time_target_reached(vdir)
+                         else EQUILIBRIUM_LOG)
+        if marker.is_file():
+            content = marker.read_text(encoding="utf-8", errors="ignore")
             with open(summary_path, "w") as f:
                 f.write(f"SINGLE VOLTAGE POINT: {voltage_name}\n\n")
                 f.write(content)
@@ -1113,6 +1238,8 @@ def run_single_voltage(system_root, voltage_name, gmx, params,
 # 全局变量 (由 main 设置，供 run_single_voltage 使用)
 args_max_loops = DEFAULT_MAX_LOOPS
 args_mode = MODE_AUTO
+# 时间判定目标时长 (ns)；None 表示使用电荷收敛判定
+args_target_time_ns = None
 
 
 # ============================================================
@@ -1162,10 +1289,37 @@ def main():
              "continue=指定续跑(用 tpr 归档+density.log 双重判定，"
              "读取轨迹总时长并回填 density.log)",
     )
+    parser.add_argument(
+        "--target-time-ns",
+        type=float,
+        default=None,
+        help="按时间判定的目标模拟时长 (ns, 正数)。指定后关闭电荷平衡判定，"
+             "改为每跑完整轮次后判断累计轨迹总时长是否达到目标，达到即完成。"
+             "建议取整轮次时长：50=1轮, 60=2轮, 70=3轮 ...。"
+             "默认 None = 使用电荷收敛判定。",
+    )
     args = parser.parse_args()
 
     args_max_loops = args.max_loops
     args_mode = args.mode
+    global args_target_time_ns
+    args_target_time_ns = args.target_time_ns
+
+    # 校验时间判定参数
+    if args_target_time_ns is not None and args_target_time_ns <= 0:
+        fail(f"--target-time-ns 必须为正数：{args_target_time_ns}")
+    if args_target_time_ns is not None:
+        grid = [(FIRST_NVE_PS + k * EXTEND_PS) / 1000.0
+                for k in range(args.max_loops + 1)]
+        on_grid = any(
+            abs(args_target_time_ns - g) <= 1.0 for g in grid
+        )
+        if not on_grid:
+            warn(
+                f"--target-time-ns {args_target_time_ns} ns 不在整轮次网格 "
+                f"({[f'{g:g}' for g in grid]} 之后...)上，"
+                f"将按[跑到 ≥ 目标时长最近的一整轮次]方式结束"
+            )
 
     # 一次性构造 gmx 子进程环境 (含 LD_LIBRARY_PATH 注入)
     gmx_env = build_gmx_env(args.gmx)
@@ -1213,6 +1367,11 @@ def main():
         print("GMX lib path : (未注入，使用进程继承环境)")
     print(f"Max loops    : {args.max_loops}")
     print(f"Run mode     : {args.mode}")
+    if args.target_time_ns is not None:
+        print(f"Target time  : {args.target_time_ns} ns "
+              f"(时间判定，关闭电荷收敛判据)")
+    else:
+        print(f"Target time  : 无 (使用电荷收敛判据)")
     if args.voltage:
         print(f"Mode         : 单电压点 ({args.voltage})")
     else:
@@ -1296,9 +1455,12 @@ def main():
     print(f"{'#' * 72}")
 
     zero_v_dir = system_root / ZERO_V
+    time_mode = args_target_time_ns is not None
 
-    if is_voltage_converged(zero_v_dir):
-        print(f"0V 已收敛 (存在 {EQUILIBRIUM_LOG})，跳过 0V，直接进入其他电压点")
+    if voltage_is_done(zero_v_dir, time_mode):
+        marker = zero_v_dir / (TIME_TARGET_LOG if is_time_target_reached(zero_v_dir)
+                               else EQUILIBRIUM_LOG)
+        print(f"0V 已完成 (存在 {marker.name})，跳过 0V，直接进入其他电压点")
     else:
         print(f"0V 未完成，开始准备并运行 0V")
 
@@ -1325,12 +1487,14 @@ def main():
             if converged:
                 break
         else:
+            done_word = "达到目标时长" if time_mode else "收敛"
             fail(
-                f"0V 在 {args.max_loops} 轮后仍未收敛，"
+                f"0V 在 {args.max_loops} 轮后仍未{done_word}，"
                 f"请人工检查 {zero_v_dir}"
             )
 
-        print(f"\n0V 已收敛！")
+        done_word = "达到目标时长" if time_mode else "已收敛"
+        print(f"\n0V {done_word}！")
 
     # ---- Phase 2: 准备 1V/2V/3V/4V ----
     print(f"\n{'#' * 72}")
@@ -1359,8 +1523,8 @@ def main():
     pending = []
     for vname in other_voltages:
         vdir = system_root / vname
-        if is_voltage_converged(vdir):
-            print(f"{vname} 已收敛，跳过")
+        if voltage_is_done(vdir, time_mode):
+            print(f"{vname} 已完成，跳过")
         else:
             pending.append(vdir)
 
@@ -1383,10 +1547,11 @@ def main():
 
         pending = next_pending
         converged_count = len(other_voltages) - len(pending)
+        done_word = "达到目标时长" if time_mode else "已收敛"
         print(
             f"\n第 {loop_count} 轮完成，"
             f"{converged_count}/{len(other_voltages)} "
-            f"个电压点已收敛，{len(pending)} 个待续"
+            f"个电压点{done_word}，{len(pending)} 个待续"
         )
 
     # ---- 汇总结果 ----
@@ -1395,52 +1560,70 @@ def main():
     print(f"{'=' * 72}")
 
     all_voltage_dirs = [system_root / v for v in VOLTAGE_DIRS]
-    all_converged = all(
-        is_voltage_converged(vd) for vd in all_voltage_dirs
+    all_done = all(
+        voltage_is_done(vd, time_mode) for vd in all_voltage_dirs
     )
 
     summary_path = system_root / EQUILIBRIUM_LOG
 
     with open(summary_path, "w") as f:
-        if all_converged:
-            f.write("ALL VOLTAGE POINTS REACHED EQUILIBRIUM\n\n")
-            f.write(
-                f"{'Voltage':<10} {'Loops':<8} {'Avg_Charge':<14} "
-                f"{'Bulk_Density':<14}\n"
-            )
-            for vd in all_voltage_dirs:
-                elog = vd / EQUILIBRIUM_LOG
-                if elog.is_file():
-                    content = elog.read_text(encoding="utf-8")
-                    loops = "?"
-                    charge = "?"
-                    density = "?"
-                    for line in content.splitlines():
-                        if line.startswith("loop="):
-                            for part in line.split():
-                                if part.startswith("loop="):
-                                    loops = part.split("=")[1]
-                                elif part.startswith("avg_charge="):
-                                    charge = part.split("=")[1]
-                                elif part.startswith("bulk_density="):
-                                    density = part.split("=")[1]
-                            break
-                    f.write(
-                        f"{vd.name:<10} {loops:<8} {charge:<14} "
-                        f"{density:<14}\n"
-                    )
-            print(f"所有电压点均已收敛！")
+        if all_done:
+            if time_mode:
+                f.write("ALL VOLTAGE POINTS REACHED TARGET TIME\n\n")
+                f.write(f"{'Voltage':<10} {'Loops':<8} {'Total_ns':<12}\n")
+                for vd in all_voltage_dirs:
+                    tlog = vd / TIME_TARGET_LOG
+                    if tlog.is_file():
+                        loops = read_marker_field(tlog, "loop")
+                        total = read_marker_field(tlog, "total_time_ns")
+                        f.write(
+                            f"{vd.name:<10} {loops:<8} {total:<12}\n"
+                        )
+                print(f"所有电压点均已达到目标时长！")
+            else:
+                f.write("ALL VOLTAGE POINTS REACHED EQUILIBRIUM\n\n")
+                f.write(
+                    f"{'Voltage':<10} {'Loops':<8} {'Avg_Charge':<14} "
+                    f"{'Bulk_Density':<14}\n"
+                )
+                for vd in all_voltage_dirs:
+                    elog = vd / EQUILIBRIUM_LOG
+                    if elog.is_file():
+                        content = elog.read_text(encoding="utf-8")
+                        loops = "?"
+                        charge = "?"
+                        density = "?"
+                        for line in content.splitlines():
+                            if line.startswith("loop="):
+                                for part in line.split():
+                                    if part.startswith("loop="):
+                                        loops = part.split("=")[1]
+                                    elif part.startswith("avg_charge="):
+                                        charge = part.split("=")[1]
+                                    elif part.startswith("bulk_density="):
+                                        density = part.split("=")[1]
+                                break
+                        f.write(
+                            f"{vd.name:<10} {loops:<8} {charge:<14} "
+                            f"{density:<14}\n"
+                        )
+                print(f"所有电压点均已收敛！")
             print(f"汇总结果已写入：{summary_path}")
         else:
-            f.write("EQUILIBRIUM NOT REACHED FOR ALL POINTS\n\n")
-            not_converged = [
+            f.write(
+                "TARGET TIME / EQUILIBRIUM NOT REACHED FOR ALL POINTS\n\n"
+            )
+            not_done = [
                 vd.name for vd in all_voltage_dirs
-                if not is_voltage_converged(vd)
+                if not voltage_is_done(vd, time_mode)
             ]
-            f.write(f"未收敛电压点 ({len(not_converged)} 个):\n")
-            for name in not_converged:
+            done_word = "未达到目标时长" if time_mode else "未收敛"
+            f.write(f"{done_word}电压点 ({len(not_done)} 个):\n")
+            for name in not_done:
                 f.write(f"  - {name}\n")
-            print(f"仍有 {len(not_converged)} 个电压点未收敛：{not_converged}")
+            print(
+                f"仍有 {len(not_done)} 个电压点{done_word}：{not_done}"
+            )
             print(f"汇总结果已写入：{summary_path}")
             print(
                 "可手动继续跑："
