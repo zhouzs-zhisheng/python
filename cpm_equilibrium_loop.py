@@ -927,14 +927,22 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
                     f"{avg_charges[-1]:.4f}, delta={delta*100:.4f}%"
                 )
             if converged:
-                density = calc_average_density(
-                    voltage_dir / DENSITY_XVG,
-                    params["bulk_z_low"], params["bulk_z_high"]
-                ) if (voltage_dir / DENSITY_XVG).is_file() else 0.0
-                write_equilibrium_log(
-                    voltage_dir, loop, avg_charges[-1], density
-                )
-                return True
+                # 电荷虽收敛，但必须确认本轮 NVE 真正跑完 (存在 nve.gro)。
+                # 若首轮/本轮在 mdrun 中途中断 (电荷文件可能在收尾前就已写出)，
+                # 则不能判完成，应继续续跑补完本轮后再作最终判定。
+                nve_gro = voltage_dir / NVE_GRO
+                if not nve_gro.is_file():
+                    print(f"  [续跑前] 电荷已收敛，但 {NVE_GRO} 尚不存在，"
+                          f"本轮 NVE 未跑完，不判完成，续跑补完本轮后再判定")
+                else:
+                    density = calc_average_density(
+                        voltage_dir / DENSITY_XVG,
+                        params["bulk_z_low"], params["bulk_z_high"]
+                    ) if (voltage_dir / DENSITY_XVG).is_file() else 0.0
+                    write_equilibrium_log(
+                        voltage_dir, loop, avg_charges[-1], density
+                    )
+                    return True
         else:
             print(f"  [续跑前] 电荷窗口数={len(avg_charges)} (<2)，需继续跑")
     elif is_first:
