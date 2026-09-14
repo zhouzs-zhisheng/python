@@ -705,13 +705,25 @@ def read_marker_field(marker_path, key):
 def voltage_is_done(voltage_dir, time_mode):
     """
     该电压点是否已达到本轮"完成"目标：
-      - 时间判定模式：只看 time_target_reached.log，忽略电荷收敛标记
+      - 时间判定模式：看 time_target_reached.log，忽略电荷收敛标记
         (因为指定时长时是"不管是否平衡，只看时间")
-      - 普通模式    ：只看 new_equilibrium_result.log
+      - 普通模式    ：看 new_equilibrium_result.log
+    无论哪种模式，必须同时满足"本轮 NVE 产物 nve.gro 已写出"，才算真正完成。
+    避免出现"标记文件仍在但 nve.gro 缺失(上次只写标记/模拟在收尾前中断)"时
+    被误判为已完成而直接跳过。缺少 nve.gro 一律视为未完成，需续跑补完本轮。
     """
     if time_mode:
-        return is_time_target_reached(voltage_dir)
-    return is_voltage_converged(voltage_dir)
+        done = is_time_target_reached(voltage_dir)
+    else:
+        done = is_voltage_converged(voltage_dir)
+    if not done:
+        return False
+    # 完成标记存在但产物缺失 -> 不构成完成
+    if not (Path(voltage_dir) / NVE_GRO).is_file():
+        print(f"  [完成判定] {Path(voltage_dir).name} 有完成标记但缺少 {NVE_GRO}，"
+              f"视为未完成，将续跑补完本轮")
+        return False
+    return True
 
 
 def is_complete_round_time(total_ps, tol_ps=1.0):
