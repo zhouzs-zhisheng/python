@@ -846,6 +846,66 @@ def prepare_input_structure(voltage_dir, source_gro, source_ndx, source_topol):
         print(f"  复制 topol.top: {source_topol} -> {dst_topol}")
     else:
         print(f"  {TOPOL_TOP} 已存在，跳过复制")
+def measurement_of_density(voltage_dir, gmx, gmx_env, params, loop=None):
+    """
+    对指定电压目录执行一次 0V 密度测量：
+      gmx density -> 体相区间平均密度 -> 写 density.log (+ 回填缺失旧轮次)。
+    依赖产物 nve.xtc / nve.tpr / index.ndx（三者与"体系是否已完成"无关，
+    因此该函数既可被每轮 NVE 之后调用，也可被 --recompute-density 在已完成
+    体系上独立重测一次）。
+
+    窗口起止 (-b begin ~ begin+窗口)：
+      - 优先读轨迹实测总时长 read_traj_total_time() 作窗口终点，
+        取最后 DENSITY_WINDOW_NS ns；读取失败则按轮次外推：
+        total = FIRST_NVE_PS + (loop-1)*EXTEND_PS，loop 缺省时用归档轮数。
+
+    返回体相平均密度 (kg/m^3 或由 calc_average_density 决定)；缺产物返回 None。
+    """
+    voltage_dir = Path(voltage_dir)
+    nve_xtc = voltage_dir / NVE_XTC
+    nve_tpr = voltage_dir / NVE_TPR
+    if not nve_xtc.is_file() or not nve_tpr.is_file():
+        warn(f"{voltage_dir.name} 缺少 {NVE_TPR} 或 {NVE_XTC}，跳过密度测量")
+        return None
+
+    # 窗口起点：优先读轨迹实测总时长，失败则按轮次外推
+    total_ps = read_traj_total_time(voltage_dir, gmx, gmx_env)
+    if total_ps is not None:
+        print(f"  窗口按轨迹实测总时长 = {total_ps:.1f} ps")
+    else:
+        if loop is None:
+            loop = max(count_archived_loops(voltage_dir), 1)
+        total_ps = FIRST_NVE_PS + (loop - 1) * EXTEND_PS
+        warn("读取轨迹实测总时长失败，回退到按轮次外推的时间口径")
+
+    begin_ps = total_ps - DENSITY_WINDOW_PS
+    if begin_ps < 0:
+        begin_ps = 0.0
+
+    sl = DENSITY_SL
+    run_command(
+        [gmx, "density", "-f", NVE_XTC, "-s", NVE_TPR, "-n", INDEX_NDX,
+         "-sl", str(sl), "-d", "Z", "-b", str(begin_ps), "-o", DENSITY_XVG],
+        cwd=str(voltage_dir),
+        stdin_text=f"{DENSITY_GROUP}\n",
+        env=gmx_env,
+    )
+
+    density = calc_average_density(
+        voltage_dir / DENSITY_XVG,
+        params["bulk_z_low"], params["bulk_z_high"]
+    )
+    print(f"  体相密度 (z={params['bulk_z_low']:.2f}~"
+          f"{params['bulk_z_high']:.2f} nm) = {density:.4f}")
+
+    # 记录 density.log (当前轮) + 回填缺失旧轮次
+    if loop is None:
+        loop = max(count_archived_loops(voltage_dir), 1)
+    append_density_log(voltage_dir / DENSITY_LOG, loop, density)
+    backfill_density_log(voltage_dir, loop - 1, gmx, gmx_env, params)
+    return density
+
+
 # ============================================================
 # 核心：单电压点单轮运行 (支持 convert-tpr 续跑)
 # ============================================================
@@ -1082,47 +1142,13 @@ def run_one_voltage(voltage_dir, gmx, params, shared_files_dir,
     #    - -b 取整条累计轨迹的最后 DENSITY_WINDOW_NS ns：
     #        累计总时长 = FIRST_NVE_PS + (loop-1)*EXTEND_PS
     #        begin = 总时长 - 窗口 (首轮 50ns 时 begin=45000，每续跑10ns后移)
-    sl = DENSITY_SL
-    total_ps = FIRST_NVE_PS + (loop - 1) * EXTEND_PS
-
-    # continue / 时间判定 模式下，优先读轨迹实测总时长作为密度窗口起点——
-    # 它反映"这次模拟真正累计跑了多久"，比按轮次外推更贴近实际
-    # (例如上一轮中途崩溃只跑了一部分时)。读取失败则回退到外推值。
-    traj_total = None
-    if args_mode == MODE_CONTINUE or is_time_mode:
-        traj_total = read_traj_total_time(voltage_dir, gmx, gmx_env)
-        if traj_total is not None:
-            print(f"  [{args_mode if is_time_mode else 'continue'}] "
-                  f"轨迹实测总时长 = {traj_total:.1f} ps"
-                  f" (按轮次外推 = {total_ps:.0f} ps)")
-            total_ps = traj_total
-        else:
-            warn("读取轨迹实测总时长失败，回退到按轮次外推的时间口径")
-    begin_ps = total_ps - DENSITY_WINDOW_PS
-
-    nve_xtc = voltage_dir / NVE_XTC
-    if not nve_xtc.is_file():
-        fail(f"{voltage_dir} 缺少 {NVE_XTC}，无法计算密度")
-
-    run_command(
-        [gmx, "density", "-f", NVE_XTC, "-s", NVE_TPR, "-n", INDEX_NDX,
-         "-sl", str(sl), "-d", "Z", "-b", str(begin_ps), "-o", DENSITY_XVG],
-        cwd=str(voltage_dir),
-        stdin_text=f"{DENSITY_GROUP}\n",
-        env=gmx_env,
+    # 5-7. 0V 密度测量 + 体相区间平均 + 写 density.log (+ 回填缺失旧轮次)
+    #     density 在每轮 NVE (首轮/续跑) 完成后测量；窗口优先取轨迹实测总时长。
+    density = measurement_of_density(
+        voltage_dir, gmx, gmx_env, params, loop=loop
     )
-
-    # 6. 算体相区间平均密度
-    density = calc_average_density(
-        voltage_dir / DENSITY_XVG,
-        params["bulk_z_low"], params["bulk_z_high"]
-    )
-    print(f"  体相密度 (z={params['bulk_z_low']:.2f}~"
-          f"{params['bulk_z_high']:.2f} nm) = {density:.4f}")
-
-    # 7. 写日志 (当前轮) + 回填缺失的旧轮次
-    append_density_log(log_file, loop, density)
-    backfill_density_log(voltage_dir, loop - 1, gmx, gmx_env, params)
+    if density is None:
+        fail(f"{voltage_dir} 无法测量密度")
 
     # 8. 判"本轮完成"：
     #    时间判定模式 -> 按目标时长 (跳过电荷收敛判据)
@@ -1320,6 +1346,14 @@ def main():
              "建议取整轮次时长：50=1轮, 60=2轮, 70=3轮 ...。"
              "默认 None = 使用电荷收敛判定。",
     )
+    parser.add_argument(
+        "--recompute-density",
+        action="store_true",
+        default=False,
+        help="对已完成 (有完成标记 + nve.gro) 的电压点，先独立重测一次体相密度"
+             "(纯只读重测 NVE 轨迹，不重跑 mdrun、不清完成标记)。"
+             "可用于修改 index/density 解析参数后刷新 density.log。",
+    )
     args = parser.parse_args()
 
     args_max_loops = args.max_loops
@@ -1450,6 +1484,24 @@ def main():
         fail(f"共用 mdp 不存在：{mdp_10ns}")
     if not mdp_50ns.is_file():
         warn(f"50ns mdp 不存在：{mdp_50ns}，首轮将使用 10ns mdp")
+
+    # --recompute-density: 对已完成点 (有完成标记 + nve.gro) 先独立重测一次密度。
+    # 纯只读重测 NVE 轨迹 (gmx density)，不重跑 mdrun、不清完成标记。
+    # 之后正常流程仍会通过 voltage_is_done 跳过这些已完成点，故不会二次测量。
+    if args.recompute_density:
+        rtime_mode = args_target_time_ns is not None
+        if args.voltage:
+            rdirs = [system_root / args.voltage]
+        else:
+            rdirs = [system_root / v for v in VOLTAGE_DIRS]
+        for rdir in rdirs:
+            if voltage_is_done(rdir, rtime_mode):
+                print(f"\n--recompute-density: 重测 {rdir.name} 体相密度 "
+                      f"(z={params['bulk_z_low']:.2f}~{params['bulk_z_high']:.2f} nm)")
+                measurement_of_density(rdir, args.gmx, gmx_env, params)
+            else:
+                warn(f"--recompute-density: {rdir.name} 未完成或无 {NVE_GRO}，"
+                     f"跳过重测")
 
     # ============================================================
     # 单电压点模式
