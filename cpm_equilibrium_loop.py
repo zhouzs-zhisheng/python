@@ -103,7 +103,9 @@ CHARGE_FILE = "CPM_electrodeCharge.dat"
 CONTROL_FILE = "CPM_ControlFile.dat"
 MATRIX_FILE = "allMatrixA.bin"
 
-DENSITY_GROUP = 6
+# 密度测量所用的索引组。写组名(而非序号)更稳健，避免 index.ndx 内组顺序
+# 变化或新增组时序号漂移导致选错组。
+DENSITY_GROUP = "IONS"
 CHARGE_INTERVAL_STEPS = 5000
 CHARGE_CONVERGENCE_THRESHOLD = 0.005
 # 0V 收敛采用绝对判据：连续两电荷窗口平均值的绝对差 < 此值(e) 即收敛。
