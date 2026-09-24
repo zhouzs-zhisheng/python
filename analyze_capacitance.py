@@ -83,21 +83,47 @@ def warn(msg):
 
 
 def load_mof_mass(system_dir, override=None):
-    """读取电极质量 (Da = g/mol)。只算 MOF 电极，取自 total_mof_mass。"""
+    """
+    读取电极质量统计并输出明细 (便于自我检查)，返回 (total_mof_mass, stats)。
+    只算 MOF 电极，总质量取自 mof_electrode_statistics.total_mof_mass (Da=g/mol)。
+    交叉验证：single_molecule_mass × total_mof_molecules ≈ total_mof_mass。
+    """
     if override is not None:
+        stats = {
+            "source": "命令行覆盖 --mof-mass",
+            "total_mof_mass": override,
+        }
         print(f"电极质量: 使用命令行覆盖值 {override} (Da)")
-        return override
+        return override, stats
+
     sf = Path(system_dir) / SYSTEM_SUMMARY
     if not sf.is_file():
         fail(f"{sf} 不存在，无法读取电极质量")
     with open(sf, "r") as f:
         summary = json.load(f)
     try:
-        mass = summary["mof_electrode_statistics"]["total_mof_mass"]
-    except KeyError:
+        stats = summary["mof_electrode_statistics"]
+        mass = float(stats["total_mof_mass"])
+    except (KeyError, TypeError):
         fail(f"{sf} 中缺少 mof_electrode_statistics.total_mof_mass")
-    print(f"电极质量: {mass} (Da = g/mol，来源 {sf.name})")
-    return float(mass)
+
+    # 交叉验证：单分子质量 × 分子数 是否等于 总质量
+    single = stats.get("single_molecule_mass")
+    nmol = stats.get("total_mof_molecules")
+    if single is not None and nmol is not None:
+        check = float(single) * float(nmol)
+        if abs(check - mass) > 1e-4 * max(1.0, abs(mass)):
+            warn(f"电极质量交叉验证不符：single_molecule_mass({single}) × "
+                 f"total_mof_molecules({nmol}) = {check:.4f} "
+                 f"≠ total_mof_mass({mass})")
+
+    print("\n电极质量统计 (mof_electrode_statistics):")
+    for k in ("single_molecule_atoms", "single_molecule_mass",
+              "total_mof_molecules", "total_mof_atoms"):
+        if k in stats:
+            print(f"  {k:24s}: {stats[k]}")
+    print(f"  {'total_mof_mass (用于电容计算)':24s}: {mass} Da (=g/mol)")
+    return mass, stats
 
 
 def read_output_frequency(path):
@@ -449,12 +475,12 @@ def main():
     if args.dt_fs <= 0:
         fail(f"--dt-fs 必须为正数：{args.dt_fs}")
 
-    mof_mass = load_mof_mass(system_dir, args.mof_mass)
+    mof_mass, electrode_stats = load_mof_mass(system_dir, args.mof_mass)
     window_fs = args.window_ns * 1e6
 
     print(f"\n体系目录 : {system_dir}")
     print(f"dt(计算间隔) : {args.dt_fs} fs | 末窗口 : {args.window_ns} ns")
-    print(f"电极质量 : {mof_mass} Da (=g/mol) | F = {FARADAY} C/mol")
+    print(f"电极质量(用于电容计算) : {mof_mass} Da (=g/mol) | F = {FARADAY} C/mol")
 
     # 1. 逐电压点收集
     points = collect_voltage_points(
@@ -495,6 +521,7 @@ def main():
         "dt_fs": args.dt_fs,
         "window_ns": args.window_ns,
         "mof_mass_g_mol": mof_mass,
+        "mof_electrode_statistics": electrode_stats,
         "faraday_C_mol": FARADAY,
         "metadata": {
             p["name"]: {
