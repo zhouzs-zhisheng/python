@@ -440,6 +440,12 @@ def main():
     system_dir = Path(args.system_dir).resolve()
     if not system_dir.is_dir():
         fail(f"体系目录不存在：{system_dir}")
+    # 若 --system-dir 指向的是电压点目录 (如 ACN/1V)，自动回退到其父目录
+    # (system_summary.json 与 0V/1V.. 同级，位于 ACN 根)。
+    if system_dir.name in VOLTAGE_DIRS:
+        warn(f"{system_dir.name} 是电压点目录，自动使用父目录作为体系根："
+             f"{system_dir.parent}")
+        system_dir = system_dir.parent
     if args.dt_fs <= 0:
         fail(f"--dt-fs 必须为正数：{args.dt_fs}")
 
