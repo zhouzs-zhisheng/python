@@ -6,8 +6,7 @@ analyze_capacitance.py
 
 从 CPM 恒电势模拟结果计算 MOF 电极的质量电容（积分电容 + 微分电容）。
 
-数据来源（每个电压点目录下，目录名形如 -2V / -1.5V / 0V / 0.5V / 1V / 2V，
- 由脚本自动发现并按电压数值从小到大排序）：
+数据来源（每个电压点目录 0V/1V/2V/3V/4V 下）：
   - CPM_electrodeCharge.dat : 每行 2 列 = (负极电荷, 正极电荷)，单位 |e|，无时间列。
                               负极电荷为负值是正常的，保留负号输出。
   - CPM_potential.dat       : 每行 3 列 = (Bulk, 负极侧电极电位, 正极侧电极电位)，
@@ -21,28 +20,28 @@ analyze_capacitance.py
   电荷与电势两个文件各自读自己的 output_frequency（可能不同），各自取末窗口。
   dt_fs (计算间隔, fs) 由用户给出。
 
-积分电容（每个非 0V 电压点）：
-  C_int [F/g] = 4 * Q_abs_avg * F / (|V_rel| * M)
+积分电容（每个非 0V 电压点，用户定义 C_int = 4Q∞/(M·V)）：
+  C_int [F/g] = 4 * Q_abs_avg * F / (V_rel * M)
   Q_abs_avg   = (|Q_neg| + |Q_pos|) / 2   （正负电极等效电荷，末窗口均值，|e|）
-  V_rel       = 该点实测电极间电位差 − 0V 实测电极间电位差 (V)，取绝对值
+  V_rel       = 该点实测电极间电位差 − 0V 实测电极间电位差 (V)
   M           = 电极质量 (total_mof_mass，Da 数值直接用)
   F           = 法拉第常数 96485 C/mol
-  公式来源（用户定义）：C_int = 4·Q∞/(M·V)，Q∞ 为该电压下平衡电荷 (|e|)，
-  V 取 |V_rel| 使负电压侧也得到正值；乘 4 为电极对几何换算因子。
-  推导：q_C = Q_e*F/N_A，m_g = M/N_A  →  C_g = Q_e*F/(V*M)（N_A 抵消）
+  推导：q_C = Q_e*F/N_A，m_g = M/N_A  →  C_g = Q_e*F/(V*M)（N_A 抵消）；
+  乘 4 为电极对几何换算因子（Q∞ 即该电压下平衡电荷）。
 
-微分电容（电压点按数值排序后取相邻点对，正极/负极各自计算）：
-  排序：目录名自动解析电压数值（-2V, -1.5V, -1V, -0.5V, 0V, 0.5V, 1V, 1.5V, 2V ...），
-       从小到大排列，相邻两个电压点构成一个区间，每个电压点对应一份电荷量。
-  ΔV          = V_rel,i+1 − V_rel,i
-  ΔQ_pos      = Q_pos,i+1 − Q_pos,i
-  ΔQ_neg      = |Q_neg,i+1| − |Q_neg,i|    （负极电荷为负，取幅值差分）
-  C_diff,pos  = ΔQ_pos * F / (ΔV * M)
-  C_diff,neg  = ΔQ_neg * F / (ΔV * M)
-  注：对称扫描时负电压侧 |Q_neg| 随 |V| 减小而减小，ΔQ_neg/C_diff,neg 在负侧
-      可能为负（负极是正极的镜像），属正常；如需恒为正，可改用电池总电荷
-      ΔQ_cell = (Q_pos − Q_neg) 差分（两侧均为正）。
-  同时输出电荷量随电压值的变化 (Q_neg/Q_pos/Q_abs_avg 随 V，见 CSV)。
+微分电容（9 点电极电位曲线，每点一个电荷量）：
+  每个模拟目录 (0V..4V) 的 CPM_potential.dat / CPM_electrodeCharge.dat 给出两个电极：
+    (V_neg, Q_neg) 与 (V_pos, Q_pos)   （V 为实测电极电位，Q 为末窗口均值电荷）
+  对应关系（9 个电极电位点来自 0-4V 的 5 个模拟）：
+    4V → -2V    3V → -1.5V  2V → -1V  1V → -0.5V
+    0V → 0   （0V 两电极电位≈0，合并为一个点）
+    1V → +0.5V  2V → +1V    3V → +1.5V  4V → +2V
+  按电极电位排序后取相邻点差分：
+    dV          = V_i+1 − V_i
+    dQ          = Q_i+1 − Q_i              （带符号；曲线单调递增 → dQ 为正值）
+    C_diff      = factor * dQ * F / (dV * M)，factor 默认 1（可用 --diff-factor 改，
+                 如与积分 4Q∞/(M·V) 一致可设 4）
+  同时输出电荷量随电压值的变化（电极电位曲线表，见 CSV kind=point）。
 
 输出（--output-dir 下，前缀 --prefix）：
   <prefix>.json : 结构化结果
@@ -65,9 +64,7 @@ from pathlib import Path
 # 常量
 # ============================================================
 
-# 电压点目录命名规则：带符号十进制数 + 可选 'V' 后缀，如 -2V / -1.5V / 0V / 0.5V / 1V / 2V。
-# 脚本自动发现并排序，不依赖固定列表（0 也可写作 "0"）。
-VOLTAGE_DIR_RE = re.compile(r"^([+-]?\d+(?:\.\d+)?)\s*V?$", re.IGNORECASE)
+VOLTAGE_DIRS = ["0V", "1V", "2V", "3V", "4V"]
 
 CHARGE_FILE = "CPM_electrodeCharge.dat"
 POTENTIAL_FILE = "CPM_potential.dat"
@@ -221,38 +218,15 @@ def last_window_mean(series, row_interval_fs, window_fs):
 # 逐电压点收集
 # ============================================================
 
-def discover_voltage_dirs(system_dir):
-    """
-    扫描体系目录下所有电压点目录（如 -2V, -1.5V, 0V, 0.5V, 1V, 2V），
-    按电压数值从小到大排序，返回目录名列表；找不到任何电压点时 fail。
-    """
-    found = []
-    for child in Path(system_dir).iterdir():
-        if not child.is_dir():
-            continue
-        m = VOLTAGE_DIR_RE.match(child.name)
-        if m:
-            found.append((float(m.group(1)), child.name))
-    found.sort(key=lambda t: t[0])
-    if not found:
-        fail(f"{system_dir} 下未发现任何电压点目录（命名如 -2V / 0V / 1V）")
-    return [name for _, name in found]
-
-
 def collect_voltage_points(system_dir, dt_fs, window_fs, sample_fs_fallback):
     """
-    自动发现电压点目录（-2V, -1.5V, 0V, 0.5V, 1V ...），按电压数值排序后
-    逐一解析电荷与电势文件，取末窗口均值。
-    返回点列表，每点 dict（含 name 目录名、voltage 数值）；
-    缺目录/文件/数据的点带 error 标记。
+    遍历 0V..4V，解析电荷与电势文件，取末窗口均值。
+    返回点列表，每点 dict；缺目录/文件/数据的点带 error 标记。
     """
-    vnames = discover_voltage_dirs(system_dir)
     points = []
-    for vname in vnames:
+    for vname in VOLTAGE_DIRS:
         vdir = Path(system_dir) / vname
-        m = VOLTAGE_DIR_RE.match(vname)
-        voltage = float(m.group(1)) if m else None
-        rec = {"name": vname, "voltage": voltage, "error": None}
+        rec = {"name": vname, "error": None}
         if not vdir.is_dir():
             rec["error"] = "目录缺失"
             points.append(rec)
@@ -308,9 +282,7 @@ def collect_voltage_points(system_dir, dt_fs, window_fs, sample_fs_fallback):
 
 def assign_v_rel(points):
     """V_rel = V_diff − V_diff(0V)。0V 缺失时退回 V_diff 并 warn。"""
-    zero = next((p for p in points
-                 if not p["error"] and p.get("voltage") == 0.0
-                 and p["V_diff"] is not None), None)
+    zero = next((p for p in points if p["name"] == "0V" and not p["error"]), None)
     if zero is None:
         warn("未找到有效的 0V 点，V_rel 退回 V_diff（无 0V 零点校正）")
         for p in points:
@@ -328,52 +300,16 @@ def assign_v_rel(points):
 # ============================================================
 
 def compute_integral(points, mof_mass):
-    """积分电容：非 0V 点，C_int = 4*Q_abs_avg*F/(|V_rel|*M)（用户定义 4Q∞/(M·V)）。"""
+    """积分电容：非 0V 点，C_int = 4*Q_abs_avg*F/(M*V_rel)（用户定义 4Q∞/(M·V)）。"""
     for p in points:
         p["C_int_F_per_g"] = None
-        if p["error"]:
+        if p["error"] or p["name"] == "0V":
             continue
-        if p["Q_abs_avg"] is None or p["V_rel"] is None or p["V_rel"] == 0:
+        if p["Q_abs_avg"] is None or p["V_rel"] is None or p["V_rel"] <= 0:
             p["C_int_F_per_g"] = float("nan")
             continue
         p["C_int_F_per_g"] = (4.0 * p["Q_abs_avg"] * FARADAY
-                              / (mof_mass * abs(p["V_rel"])))
-
-
-def compute_differential(points, mof_mass):
-    """微分电容：按电压数值排序后，相邻有效点对，正/负极各自计算，ΔQ 取幅值。"""
-    ok = [p for p in points if not p["error"]]
-    ok.sort(key=lambda p: p["voltage"] if p.get("voltage") is not None
-            else float("-inf"))
-    diffs = []
-    for i in range(len(ok) - 1):
-        p0, p1 = ok[i], ok[i + 1]
-        d = {
-            "pair": f"{p0['name']}→{p1['name']}",
-            "dV": None,
-            "dQ_pos": None,
-            "dQ_neg": None,
-            "C_diff_pos_F_per_g": None,
-            "C_diff_neg_F_per_g": None,
-        }
-        if p0["V_rel"] is not None and p1["V_rel"] is not None:
-            d["dV"] = p1["V_rel"] - p0["V_rel"]
-        if p0["Q_pos"] is not None and p1["Q_pos"] is not None:
-            d["dQ_pos"] = p1["Q_pos"] - p0["Q_pos"]
-        if p0["Q_neg"] is not None and p1["Q_neg"] is not None:
-            d["dQ_neg"] = abs(p1["Q_neg"]) - abs(p0["Q_neg"])  # 取幅值差分
-        if (d["dV"] is not None and d["dV"] != 0
-                and d["dQ_pos"] is not None):
-            d["C_diff_pos_F_per_g"] = d["dQ_pos"] * FARADAY / (d["dV"] * mof_mass)
-        else:
-            d["C_diff_pos_F_per_g"] = float("nan")
-        if (d["dV"] is not None and d["dV"] != 0
-                and d["dQ_neg"] is not None):
-            d["C_diff_neg_F_per_g"] = d["dQ_neg"] * FARADAY / (d["dV"] * mof_mass)
-        else:
-            d["C_diff_neg_F_per_g"] = float("nan")
-        diffs.append(d)
-    return diffs
+                              / (mof_mass * p["V_rel"]))
 
 
 def safe_avg(values):
@@ -381,20 +317,99 @@ def safe_avg(values):
     return sum(vals) / len(vals) if vals else float("nan")
 
 
-def build_summary(points, diffs):
+def build_summary(points, diffs, curve):
     c_ints = [p["C_int_F_per_g"] for p in points
               if p.get("C_int_F_per_g") is not None]
+    c_diffs = [d["C_diff_F_per_g"] for d in diffs
+               if d.get("C_diff_F_per_g") is not None]
     return {
         "n_voltages_total": len(points),
         "n_voltages_ok": sum(1 for p in points if not p["error"]),
+        "n_curve_points": len(curve),
         "n_pairs": len(diffs),
         "C_int_avg_F_per_g": safe_avg(c_ints),
         "C_int_max_F_per_g": max(c_ints) if c_ints else float("nan"),
-        "C_diff_pos_avg_F_per_g": safe_avg(
-            [d["C_diff_pos_F_per_g"] for d in diffs]),
-        "C_diff_neg_avg_F_per_g": safe_avg(
-            [d["C_diff_neg_F_per_g"] for d in diffs]),
+        "C_diff_avg_F_per_g": safe_avg(c_diffs),
     }
+
+
+# ============================================================
+# 微分电容：9 点电极曲线
+# ============================================================
+
+def build_electrode_curve(points, zero_charge_mode="abs_avg"):
+    """
+    由各模拟目录 (0V..4V) 构建 9 点电极电位曲线。
+
+    每个模拟目录的 CPM_potential.dat / CPM_electrodeCharge.dat 给出两个电极：
+      (V_neg, Q_neg) 与 (V_pos, Q_pos)   （V 为实测电极电位，Q 为末窗口均值电荷）
+    对应关系（9 个电极电位点来自 0-4V 的 5 个模拟）：
+      4V -> -2V   3V -> -1.5V  2V -> -1V  1V -> -0.5V
+      0V -> 0
+      1V -> +0.5V 2V -> +1V    3V -> +1.5V 4V -> +2V
+    其中 0V 目录的两个电极电位都≈0，合并为一个 "0" 点。
+
+    返回按电极电位升序排列的点列表，每点 dict:
+      potential, charge, sim(来源目录), electrode('neg'/'pos'/'mid')
+    """
+    curve = []
+    zero = None
+    for p in points:
+        if p["error"]:
+            continue
+        if p["name"] == "0V":
+            # 0V：两个电极电位≈0，合并为一个中点
+            pot = (p["V_neg"] + p["V_pos"]) / 2.0
+            if zero_charge_mode == "abs_avg":
+                q = p["Q_abs_avg"]
+            elif zero_charge_mode == "zero":
+                q = 0.0
+            elif zero_charge_mode == "neg":
+                q = p["Q_neg"]
+            else:  # default abs_avg
+                q = p["Q_abs_avg"]
+            zero = {"potential": pot, "charge": q,
+                    "sim": p["name"], "electrode": "mid"}
+            continue
+        curve.append({"potential": p["V_neg"], "charge": p["Q_neg"],
+                      "sim": p["name"], "electrode": "neg"})
+        curve.append({"potential": p["V_pos"], "charge": p["Q_pos"],
+                      "sim": p["name"], "electrode": "pos"})
+    if zero is not None:
+        curve.append(zero)
+    curve.sort(key=lambda c: c["potential"])
+    return curve
+
+
+def compute_differential_curve(curve, mof_mass, factor=1.0):
+    """
+    微分电容：9 点电极曲线中相邻两点的 dQ/dV。
+    返回 8 个区间，每区间 dict:
+      pair, side(neg/pos/neg-pos), V_from, V_to, dV, dQ, C_diff_F_per_g
+    """
+    diffs = []
+    for i in range(len(curve) - 1):
+        c0, c1 = curve[i], curve[i + 1]
+        side = c0["electrode"]
+        if c0["electrode"] != c1["electrode"]:
+            side = f"{c0['electrode']}-{c1['electrode']}"
+        d = {
+            "pair": f"{c0['potential']:.3f}V→{c1['potential']:.3f}V",
+            "side": side,
+            "V_from": c0["potential"],
+            "V_to": c1["potential"],
+            "dV": c1["potential"] - c0["potential"],
+            "dQ": c1["charge"] - c0["charge"],
+            "C_diff_F_per_g": None,
+        }
+        if (d["dV"] is not None and d["dV"] != 0
+                and d["dQ"] is not None):
+            d["C_diff_F_per_g"] = (factor * d["dQ"] * FARADAY
+                                   / (d["dV"] * mof_mass))
+        else:
+            d["C_diff_F_per_g"] = float("nan")
+        diffs.append(d)
+    return diffs
 
 
 # ============================================================
@@ -420,14 +435,21 @@ def print_integral_table(points):
               f"{fmt(p['Q_abs_avg'], 13)} {fmt(p['C_int_F_per_g'], 12)}")
 
 
+def print_curve_table(curve):
+    print("\n==== 电极电位曲线 (9 点，电荷量随电压值的变化) ====")
+    print(f"{'电位(V)':>10} {'电荷(e)':>12} {'来源':>6} {'电极':>6}")
+    for c in curve:
+        print(f"{fmt(c['potential'], 10, 3)} {fmt(c['charge'], 12)} "
+              f"{c['sim']:>6} {c['electrode']:>6}")
+
+
 def print_differential_table(diffs):
     print("\n==================== 微分电容 ====================")
-    print(f"{'区间':<14} {'dV(V)':>8} {'dQ_pos(e)':>12} {'dQ_neg(e)':>12} "
-          f"{'C_diff_pos(F/g)':>16} {'C_diff_neg(F/g)':>16}")
+    print(f"{'区间':<16} {'侧':>10} {'dV(V)':>8} {'dQ(e)':>10} "
+          f"{'C_diff(F/g)':>14}")
     for d in diffs:
-        print(f"{d['pair']:<14} {fmt(d['dV'], 8)} {fmt(d['dQ_pos'], 12)} "
-              f"{fmt(d['dQ_neg'], 12)} {fmt(d['C_diff_pos_F_per_g'], 16)} "
-              f"{fmt(d['C_diff_neg_F_per_g'], 16)}")
+        print(f"{d['pair']:<16} {d['side']:>10} {fmt(d['dV'], 8)} "
+              f"{fmt(d['dQ'], 10)} {fmt(d['C_diff_F_per_g'], 14)}")
 
 
 def write_json(result, out_path):
@@ -439,12 +461,13 @@ def write_json(result, out_path):
 CSV_COLUMNS = [
     "kind", "label", "V_rel", "dV",
     "Q_neg", "Q_abs_neg", "Q_pos", "Q_abs_avg",
-    "dQ_pos", "dQ_neg",
-    "C_int_F_per_g", "C_diff_pos_F_per_g", "C_diff_neg_F_per_g",
+    "potential", "charge", "sim", "electrode",
+    "dQ",
+    "C_int_F_per_g", "C_diff_F_per_g",
 ]
 
 
-def write_csv(points, diffs, out_path):
+def write_csv(points, diffs, curve, out_path):
     import csv as csv_mod
     rows = []
     for p in points:
@@ -455,9 +478,21 @@ def write_csv(points, diffs, out_path):
             "V_rel": p["V_rel"], "dV": None,
             "Q_neg": p["Q_neg"], "Q_abs_neg": p["Q_abs_neg"],
             "Q_pos": p["Q_pos"], "Q_abs_avg": p["Q_abs_avg"],
-            "dQ_pos": None, "dQ_neg": None,
+            "potential": None, "charge": None, "sim": None, "electrode": None,
+            "dQ": None,
             "C_int_F_per_g": p["C_int_F_per_g"],
-            "C_diff_pos_F_per_g": None, "C_diff_neg_F_per_g": None,
+            "C_diff_F_per_g": None,
+        })
+    for c in curve:
+        rows.append({
+            "kind": "point", "label": f"{c['potential']:.3f}V",
+            "V_rel": None, "dV": None,
+            "Q_neg": None, "Q_abs_neg": None,
+            "Q_pos": None, "Q_abs_avg": None,
+            "potential": c["potential"], "charge": c["charge"],
+            "sim": c["sim"], "electrode": c["electrode"],
+            "dQ": None,
+            "C_int_F_per_g": None, "C_diff_F_per_g": None,
         })
     for d in diffs:
         rows.append({
@@ -465,10 +500,11 @@ def write_csv(points, diffs, out_path):
             "V_rel": None, "dV": d["dV"],
             "Q_neg": None, "Q_abs_neg": None,
             "Q_pos": None, "Q_abs_avg": None,
-            "dQ_pos": d["dQ_pos"], "dQ_neg": d["dQ_neg"],
+            "potential": None, "charge": None,
+            "sim": None, "electrode": d["side"],
+            "dQ": d["dQ"],
             "C_int_F_per_g": None,
-            "C_diff_pos_F_per_g": d["C_diff_pos_F_per_g"],
-            "C_diff_neg_F_per_g": d["C_diff_neg_F_per_g"],
+            "C_diff_F_per_g": d["C_diff_F_per_g"],
         })
     with open(out_path, "w", newline="") as f:
         writer = csv_mod.DictWriter(f, fieldnames=CSV_COLUMNS)
@@ -499,6 +535,13 @@ def main():
                         help="兜底：每行时间间隔 (fs)，头注释解析失败时使用")
     parser.add_argument("--mof-mass", type=float, default=None,
                         help="覆盖电极质量 (Da)，默认读 system_summary.json")
+    parser.add_argument("--zero-charge", choices=["abs_avg", "zero", "neg"],
+                        default="abs_avg",
+                        help="微分曲线 '0' 点电荷取值：abs_avg=正负电极幅值均值"
+                             "(默认)，zero=0，neg=负电极实测电荷")
+    parser.add_argument("--diff-factor", type=float, default=1.0,
+                        help="微分电容乘数，默认 1（即 ΔQ*F/(ΔV*M)）；"
+                             "若需与积分 4Q∞/(M·V) 一致可设 4")
     args = parser.parse_args()
 
     system_dir = Path(args.system_dir).resolve()
@@ -506,7 +549,7 @@ def main():
         fail(f"体系目录不存在：{system_dir}")
     # 若 --system-dir 指向的是电压点目录 (如 ACN/1V)，自动回退到其父目录
     # (system_summary.json 与 0V/1V.. 同级，位于 ACN 根)。
-    if VOLTAGE_DIR_RE.match(system_dir.name):
+    if system_dir.name in VOLTAGE_DIRS:
         warn(f"{system_dir.name} 是电压点目录，自动使用父目录作为体系根："
              f"{system_dir.parent}")
         system_dir = system_dir.parent
@@ -520,7 +563,7 @@ def main():
     print(f"dt(计算间隔) : {args.dt_fs} fs | 末窗口 : {args.window_ns} ns")
     print(f"电极质量(用于电容计算) : {mof_mass} Da (=g/mol) | F = {FARADAY} C/mol")
 
-    # 1. 逐电压点收集
+    # 1. 逐电压点收集 (0V..4V)
     points = collect_voltage_points(
         system_dir, args.dt_fs, window_fs, args.sample_fs
     )
@@ -528,17 +571,19 @@ def main():
     # 2. 0V 零点校正 V_rel
     assign_v_rel(points)
 
-    # 3. 积分电容
+    # 3. 积分电容 (4Q∞/(M·V))
     compute_integral(points, mof_mass)
 
-    # 4. 微分电容
-    diffs = compute_differential(points, mof_mass)
+    # 4. 微分电容：9 点电极曲线 -> 相邻点差分
+    curve = build_electrode_curve(points, args.zero_charge)
+    diffs = compute_differential_curve(curve, mof_mass, args.diff_factor)
 
     # 5. 汇总
-    summary = build_summary(points, diffs)
+    summary = build_summary(points, diffs, curve)
 
     # 6. 终端输出
     print_integral_table(points)
+    print_curve_table(curve)
     print_differential_table(diffs)
     print(f"\n==================== 汇总 ====================")
     for k, v in summary.items():
@@ -561,6 +606,9 @@ def main():
         "mof_mass_g_mol": mof_mass,
         "mof_electrode_statistics": electrode_stats,
         "faraday_C_mol": FARADAY,
+        "integral_formula": "C_int = 4 * Q_abs_avg * F / (M * V_rel)",
+        "differential_formula": f"C_diff = {args.diff_factor} * dQ * F / (dV * M)",
+        "zero_charge_mode": args.zero_charge,
         "metadata": {
             p["name"]: {
                 "output_frequency_charge": p["output_frequency_charge"],
@@ -574,17 +622,17 @@ def main():
         },
         "voltages": [
             {k: p[k] for k in
-             ("name", "voltage", "V_neg", "V_pos", "V_diff", "V_rel",
+             ("name", "V_neg", "V_pos", "V_diff", "V_rel",
               "Q_neg", "Q_abs_neg", "Q_pos", "Q_abs_avg", "C_int_F_per_g")}
-            if not p["error"] else {"name": p["name"], "voltage": p.get("voltage"),
-                                    "error": p["error"]}
+            if not p["error"] else {"name": p["name"], "error": p["error"]}
             for p in points
         ],
+        "electrode_curve": curve,
         "differential": diffs,
         "summary": summary,
     }
     write_json(result, json_path)
-    write_csv(points, diffs, csv_path)
+    write_csv(points, diffs, curve, csv_path)
 
     print("\n完成。")
 
