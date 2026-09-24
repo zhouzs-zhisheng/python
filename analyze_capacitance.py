@@ -6,7 +6,8 @@ analyze_capacitance.py
 
 从 CPM 恒电势模拟结果计算 MOF 电极的质量电容（积分电容 + 微分电容）。
 
-数据来源（每个电压点目录 0V/1V/2V/3V/4V 下）：
+数据来源（每个电压点目录下，目录名形如 -2V / -1.5V / 0V / 0.5V / 1V / 2V，
+ 由脚本自动发现并按电压数值从小到大排序）：
   - CPM_electrodeCharge.dat : 每行 2 列 = (负极电荷, 正极电荷)，单位 |e|，无时间列。
                               负极电荷为负值是正常的，保留负号输出。
   - CPM_potential.dat       : 每行 3 列 = (Bulk, 负极侧电极电位, 正极侧电极电位)，
@@ -21,19 +22,26 @@ analyze_capacitance.py
   dt_fs (计算间隔, fs) 由用户给出。
 
 积分电容（每个非 0V 电压点）：
-  C_int [F/g] = Q_abs_avg * F / (V_rel * M)
+  C_int [F/g] = 4 * Q_abs_avg * F / (|V_rel| * M)
   Q_abs_avg   = (|Q_neg| + |Q_pos|) / 2   （正负电极等效电荷，末窗口均值，|e|）
-  V_rel       = 该点实测电极间电位差 − 0V 实测电极间电位差 (V)
+  V_rel       = 该点实测电极间电位差 − 0V 实测电极间电位差 (V)，取绝对值
   M           = 电极质量 (total_mof_mass，Da 数值直接用)
   F           = 法拉第常数 96485 C/mol
+  公式来源（用户定义）：C_int = 4·Q∞/(M·V)，Q∞ 为该电压下平衡电荷 (|e|)，
+  V 取 |V_rel| 使负电压侧也得到正值；乘 4 为电极对几何换算因子。
   推导：q_C = Q_e*F/N_A，m_g = M/N_A  →  C_g = Q_e*F/(V*M)（N_A 抵消）
 
-微分电容（相邻电压点对，正极/负极各自计算）：
+微分电容（电压点按数值排序后取相邻点对，正极/负极各自计算）：
+  排序：目录名自动解析电压数值（-2V, -1.5V, -1V, -0.5V, 0V, 0.5V, 1V, 1.5V, 2V ...），
+       从小到大排列，相邻两个电压点构成一个区间，每个电压点对应一份电荷量。
   ΔV          = V_rel,i+1 − V_rel,i
   ΔQ_pos      = Q_pos,i+1 − Q_pos,i
-  ΔQ_neg      = |Q_neg,i+1| − |Q_neg,i|    （负极电荷为负，取幅值差分 → 正值）
+  ΔQ_neg      = |Q_neg,i+1| − |Q_neg,i|    （负极电荷为负，取幅值差分）
   C_diff,pos  = ΔQ_pos * F / (ΔV * M)
   C_diff,neg  = ΔQ_neg * F / (ΔV * M)
+  注：对称扫描时负电压侧 |Q_neg| 随 |V| 减小而减小，ΔQ_neg/C_diff,neg 在负侧
+      可能为负（负极是正极的镜像），属正常；如需恒为正，可改用电池总电荷
+      ΔQ_cell = (Q_pos − Q_neg) 差分（两侧均为正）。
   同时输出电荷量随电压值的变化 (Q_neg/Q_pos/Q_abs_avg 随 V，见 CSV)。
 
 输出（--output-dir 下，前缀 --prefix）：
@@ -57,7 +65,9 @@ from pathlib import Path
 # 常量
 # ============================================================
 
-VOLTAGE_DIRS = ["0V", "1V", "2V", "3V", "4V"]
+# 电压点目录命名规则：带符号十进制数 + 可选 'V' 后缀，如 -2V / -1.5V / 0V / 0.5V / 1V / 2V。
+# 脚本自动发现并排序，不依赖固定列表（0 也可写作 "0"）。
+VOLTAGE_DIR_RE = re.compile(r"^([+-]?\d+(?:\.\d+)?)\s*V?$", re.IGNORECASE)
 
 CHARGE_FILE = "CPM_electrodeCharge.dat"
 POTENTIAL_FILE = "CPM_potential.dat"
@@ -211,15 +221,38 @@ def last_window_mean(series, row_interval_fs, window_fs):
 # 逐电压点收集
 # ============================================================
 
+def discover_voltage_dirs(system_dir):
+    """
+    扫描体系目录下所有电压点目录（如 -2V, -1.5V, 0V, 0.5V, 1V, 2V），
+    按电压数值从小到大排序，返回目录名列表；找不到任何电压点时 fail。
+    """
+    found = []
+    for child in Path(system_dir).iterdir():
+        if not child.is_dir():
+            continue
+        m = VOLTAGE_DIR_RE.match(child.name)
+        if m:
+            found.append((float(m.group(1)), child.name))
+    found.sort(key=lambda t: t[0])
+    if not found:
+        fail(f"{system_dir} 下未发现任何电压点目录（命名如 -2V / 0V / 1V）")
+    return [name for _, name in found]
+
+
 def collect_voltage_points(system_dir, dt_fs, window_fs, sample_fs_fallback):
     """
-    遍历 0V..4V，解析电荷与电势文件，取末窗口均值。
-    返回点列表，每点 dict；缺目录/文件/数据的点带 error 标记。
+    自动发现电压点目录（-2V, -1.5V, 0V, 0.5V, 1V ...），按电压数值排序后
+    逐一解析电荷与电势文件，取末窗口均值。
+    返回点列表，每点 dict（含 name 目录名、voltage 数值）；
+    缺目录/文件/数据的点带 error 标记。
     """
+    vnames = discover_voltage_dirs(system_dir)
     points = []
-    for vname in VOLTAGE_DIRS:
+    for vname in vnames:
         vdir = Path(system_dir) / vname
-        rec = {"name": vname, "error": None}
+        m = VOLTAGE_DIR_RE.match(vname)
+        voltage = float(m.group(1)) if m else None
+        rec = {"name": vname, "voltage": voltage, "error": None}
         if not vdir.is_dir():
             rec["error"] = "目录缺失"
             points.append(rec)
@@ -275,7 +308,9 @@ def collect_voltage_points(system_dir, dt_fs, window_fs, sample_fs_fallback):
 
 def assign_v_rel(points):
     """V_rel = V_diff − V_diff(0V)。0V 缺失时退回 V_diff 并 warn。"""
-    zero = next((p for p in points if p["name"] == "0V" and not p["error"]), None)
+    zero = next((p for p in points
+                 if not p["error"] and p.get("voltage") == 0.0
+                 and p["V_diff"] is not None), None)
     if zero is None:
         warn("未找到有效的 0V 点，V_rel 退回 V_diff（无 0V 零点校正）")
         for p in points:
@@ -293,25 +328,28 @@ def assign_v_rel(points):
 # ============================================================
 
 def compute_integral(points, mof_mass):
-    """积分电容：非 0V 点，C_int = Q_abs_avg*F/(V_rel*M)。"""
+    """积分电容：非 0V 点，C_int = 4*Q_abs_avg*F/(|V_rel|*M)（用户定义 4Q∞/(M·V)）。"""
     for p in points:
         p["C_int_F_per_g"] = None
-        if p["error"] or p["name"] == "0V":
+        if p["error"]:
             continue
-        if p["Q_abs_avg"] is None or p["V_rel"] is None or p["V_rel"] <= 0:
+        if p["Q_abs_avg"] is None or p["V_rel"] is None or p["V_rel"] == 0:
             p["C_int_F_per_g"] = float("nan")
             continue
-        p["C_int_F_per_g"] = p["Q_abs_avg"] * FARADAY / (p["V_rel"] * mof_mass)
+        p["C_int_F_per_g"] = (4.0 * p["Q_abs_avg"] * FARADAY
+                              / (mof_mass * abs(p["V_rel"])))
 
 
 def compute_differential(points, mof_mass):
-    """微分电容：相邻有效点对，正/负极各自计算，ΔQ 取幅值。"""
-    diffs = []
+    """微分电容：按电压数值排序后，相邻有效点对，正/负极各自计算，ΔQ 取幅值。"""
     ok = [p for p in points if not p["error"]]
+    ok.sort(key=lambda p: p["voltage"] if p.get("voltage") is not None
+            else float("-inf"))
+    diffs = []
     for i in range(len(ok) - 1):
         p0, p1 = ok[i], ok[i + 1]
         d = {
-            "pair": f"{p0['name']}-{p1['name']}",
+            "pair": f"{p0['name']}→{p1['name']}",
             "dV": None,
             "dQ_pos": None,
             "dQ_neg": None,
@@ -384,10 +422,10 @@ def print_integral_table(points):
 
 def print_differential_table(diffs):
     print("\n==================== 微分电容 ====================")
-    print(f"{'区间':<8} {'dV(V)':>8} {'dQ_pos(e)':>12} {'dQ_neg(e)':>12} "
+    print(f"{'区间':<14} {'dV(V)':>8} {'dQ_pos(e)':>12} {'dQ_neg(e)':>12} "
           f"{'C_diff_pos(F/g)':>16} {'C_diff_neg(F/g)':>16}")
     for d in diffs:
-        print(f"{d['pair']:<8} {fmt(d['dV'], 8)} {fmt(d['dQ_pos'], 12)} "
+        print(f"{d['pair']:<14} {fmt(d['dV'], 8)} {fmt(d['dQ_pos'], 12)} "
               f"{fmt(d['dQ_neg'], 12)} {fmt(d['C_diff_pos_F_per_g'], 16)} "
               f"{fmt(d['C_diff_neg_F_per_g'], 16)}")
 
@@ -468,7 +506,7 @@ def main():
         fail(f"体系目录不存在：{system_dir}")
     # 若 --system-dir 指向的是电压点目录 (如 ACN/1V)，自动回退到其父目录
     # (system_summary.json 与 0V/1V.. 同级，位于 ACN 根)。
-    if system_dir.name in VOLTAGE_DIRS:
+    if VOLTAGE_DIR_RE.match(system_dir.name):
         warn(f"{system_dir.name} 是电压点目录，自动使用父目录作为体系根："
              f"{system_dir.parent}")
         system_dir = system_dir.parent
@@ -536,9 +574,10 @@ def main():
         },
         "voltages": [
             {k: p[k] for k in
-             ("name", "V_neg", "V_pos", "V_diff", "V_rel",
+             ("name", "voltage", "V_neg", "V_pos", "V_diff", "V_rel",
               "Q_neg", "Q_abs_neg", "Q_pos", "Q_abs_avg", "C_int_F_per_g")}
-            if not p["error"] else {"name": p["name"], "error": p["error"]}
+            if not p["error"] else {"name": p["name"], "voltage": p.get("voltage"),
+                                    "error": p["error"]}
             for p in points
         ],
         "differential": diffs,
